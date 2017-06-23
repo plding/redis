@@ -12,7 +12,7 @@ endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG?= -g -rdynamic -ggdb
 
-OBJ = redis.o zmalloc.o sds.o anet.o
+OBJ = redis.o zmalloc.o sds.o anet.o ae.o adlist.o dict.o
 CLIOBJ = redis-cli.o zmalloc.o sds.o anet.o
 
 PROGRAM = redis-server

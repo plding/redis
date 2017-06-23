@@ -67,11 +67,11 @@
 #endif
 
 #include "redis.h"
-// #include "ae.h"         /* Event driven programming library */
+#include "ae.h"         /* Event driven programming library */
 #include "sds.h"        /* Dynamic safe strings */
 #include "anet.h"       /* Networking the easy way */
-// #include "dict.h"       /* Hash tables */
-// #include "adlist.h"     /* Linked lists */
+#include "dict.h"       /* Hash tables */
+#include "adlist.h"     /* Linked lists */
 #include "zmalloc.h"    /* total memory usage aware version of malloc/free */
 // #include "lzf.h"        /* LZF compression library */
 // #include "pqsort.h"     /* Partial qsort for SORT+LIMIT */
@@ -101,10 +101,31 @@
 #define REDIS_NOTICE    2
 #define REDIS_WARNING   3
 
+/* Anti-warning macro... */
+#define REDIS_NOTUSED(V) ((void) V)
+
+/*================================= Data types ============================== */
+
+/* With multiplexing we need to take per-clinet state.
+ * Clients are taken in a liked list. */
+typedef struct redisClient {
+    int fd;
+    sds querybuf;
+    time_t lastinteraction; /* time of the last interaction, used for timeout */
+} redisClient;
+
 /* Global server state structure */
 struct redisServer {
     int port;
     int fd;
+    list *clients;
+    char neterr[ANET_ERR_LEN];
+    aeEventLoop *el;
+    int cronloops;              /* number of times the cron function run */
+    /* Fields used only for stats */
+    time_t stat_starttime;         /* server start time */
+    long long stat_numcommands;    /* number of processed commands */
+    long long stat_numconnections; /* number of connections received */
     /* Configuration */
     int verbosity;
     int maxidletime;
@@ -113,12 +134,21 @@ struct redisServer {
     char *pidfile;
     char *logfile;
     char *bindaddr;
+    unsigned int maxclients;
+    time_t unixtime;    /* Unix time sampled every second. */
 };
+
+/*================================ Prototypes =============================== */
+
+static void freeClient(redisClient *c);
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
 /*================================= Globals ================================= */
 
 /* Global vars */
 static struct redisServer server; /* server global state */
+
+/*============================ Utility functions ============================ */
 
 static void redisLog(int level, const char *fmt, ...) {
     va_list ap;
@@ -145,6 +175,34 @@ static void redisLog(int level, const char *fmt, ...) {
     if (server.logfile) fclose(fp);
 }
 
+/* ========================= Random utility functions ======================= */
+
+/* Redis generally does not try to recover from out of memory conditions
+ * when allocating objects or strings, it is not clear if it will be possible
+ * to report this condition to the client since the networking layer itself
+ * is based on heap allocation for send buffers, so we simply abort.
+ * At least the code will be simpler to read... */
+static void oom(const char *msg) {
+    redisLog(REDIS_WARNING, "%s: Out of memory\n", msg);
+    sleep(1);
+    abort();
+}
+
+static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    int j, loops = server.cronloops++;
+    REDIS_NOTUSED(eventLoop);
+    REDIS_NOTUSED(id);
+    REDIS_NOTUSED(clientData);
+
+    /* We take a cached value of the unix time in the global state because
+     * with virtual memory and aging there is to store the current time
+     * in objects at every object access, and accuracy is not needed.
+     * To access a global var is faster than calling time(NULL) */
+    server.unixtime = time(NULL);
+
+    return 1000;
+}
+
 static void initServerConfig() {
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.port = REDIS_SERVERPORT;
@@ -159,6 +217,18 @@ static void initServerConfig() {
 static void initServer() {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
+
+    server.clients = listCreate();
+    server.el = aeCreateEventLoop();
+    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    if (server.fd == -1) {
+        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
+        exit(1);
+    }
+
+    aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
+    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+        acceptHandler, NULL) == AE_ERR) oom("creating file event");
 }
 
 static void loadServerConfig(char *filename) {
@@ -224,6 +294,200 @@ loaderr:
     fprintf(stderr, ">>> '%s'\n", line);
     fprintf(stderr, "%s\n", err);
     exit(1);
+}
+
+static void freeClient(redisClient *c) {
+    listNode *ln;
+
+    /* Note that if the client we are freeing is blocked into a blocking
+     * call, we have to set querybuf to NULL *before* to call
+     * unblockClientWaitingData() to avoid processInputBuffer() will get
+     * called. Also it is important to remove the file events after
+     * this, because this call adds the READABLE event. */
+    sdsfree(c->querybuf);
+    c->querybuf = NULL;
+
+    aeDeleteFileEvent(server.el, c->fd, AE_READABLE);
+    aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    close(c->fd);
+    /* Remove from the list of clients */
+    ln = listSearchKey(server.clients, c);
+    // redisAssert(ln != NULL);
+    listDelNode(server.clients, ln);
+    zfree(c);
+}
+
+/* If this function gets called we already read a whole
+ * command, argments are in the client argv/argc fields.
+ * processCommand() execute the command or prepare the
+ * server for a bulk read from the client.
+ *
+ * If 1 is returned the client is still alive and valid and
+ * and other operations can be performed by the caller. Otherwise
+ * if 0 is returned the client was destroied (i.e. after QUIT). */
+static int processCommand(redisClient *c) {
+    /* The QUIT command is handled as a special case. Normal command
+     * procs are unable to close the client connection safely */
+    if (!strcasecmp(c->argv[0]->ptr, "quit")) {
+        freeClient(c);
+        return 0;
+    }
+
+    /* Now lookup the command and check ASAP about trivial error conditions
+     * such wrong arity, bad command name and so forth. */
+    addReplySds(c, sdscatprintf(sdsempty(), "-ERR unknown command '%s'\r\n",
+        (char *) c->argv[0]->ptr));
+    return 1;
+}
+
+static void processInputBuffer(redisClient *c) {
+again:
+    /* Before to process the input buffer, make sure the client is not
+     * waitig for a blocking operation such as BLPOP. Note that the first
+     * iteration the client is never blocked, otherwise the processInputBuffer
+     * would not be called at all, but after the execution of the first commands
+     * in the input buffer the client may be blocked, and the "goto again"
+     * will try to reiterate. The following line will make it return asap. */
+    if (c->flags & REDIS_BLOCKED || c->flags & REDIS_IO_WAIT) return;
+    if (c->bulklen == -1) {
+        /* Read the first line of the query */
+        char *p = strchr(c->querybuf, '\n');
+        size_t querylen;
+
+        if (p) {
+            sds query, *argv;
+            int argc, j;
+
+            query = c->querybuf;
+            c->querybuf = sdsempty();
+            querylen = 1 + (p - query);
+            if (sdslen(query) > querylen) {
+                /* leave data after the first line of the query in the buffer */
+                c->querybuf = sdscatlen(c->querybuf, query + querylen, sdslen(query) - querylen);
+            }
+            *p = '\0';  /* remove "\n" */
+            if (*(p - 1) == '\r') *(p - 1) = '\0'; /* and "\r" if any */
+            sdsupdatelen(query);
+
+            /* Now we can split the query in arguments */
+            argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
+            sdsfree(query);
+
+            if (c->argv) zfree(c->argv);
+            c->argv = zmalloc(sizeof(robj *) * argc);
+
+            for (j = 0; j < argc; j++) {
+                if (sdslen(argv[j])) {
+                    c->argv[c->argc] = createObject(REDIS_STRING, argv[j]);
+                    c->argc++;
+                } else {
+                    sdsfree(argv[j]);
+                }
+            }
+            zfree(argv);
+            if (c->argc) {
+                /* Execute the command. If the client is still valid
+                 * after processCommand() return and there is something
+                 * on the query buffer try to process the next command. */
+                if (processCommand(c) && sdslen(c->querybuf)) goto again;
+            } else {
+                /* Nothing to process, argc == 0. Just process the query
+                 * buffer if it's not empty or return to the caller */
+                if (sdslen(c->querybuf)) goto again;
+            }
+            return;
+        } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
+            redisLog(REDIS_VERBOSE, "Client protocol error");
+            freeClient(c);
+            return;
+        }
+    } else {
+
+    }
+}
+
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    redisClient *c = (redisClient *) privdata;
+    char buf[REDIS_IOBUF_LEN];
+    int nread;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+
+    nread = read(fd, buf, REDIS_IOBUF_LEN);
+    if (nread == -1) {
+        if (errno == EAGAIN) {
+            nread = 0;
+        } else {
+            redisLog(REDIS_VERBOSE, "Reading from client: %s", strerror(errno));
+            freeClient(c);
+            return;
+        }
+    } else if (nread == 0) {
+        redisLog(REDIS_VERBOSE, "Client closed connection");
+        freeClient(c);
+        return;
+    }
+    if (nread) {
+        c->querybuf = sdscatlen(c->querybuf, buf, nread);
+        c->lastinteraction = time(NULL);
+    } else {
+        return;
+    }
+    if (!(c->flags & REDIS_BLOCKED))
+        processInputBuffer(c);
+}
+
+static redisClient *createClient(int fd) {
+    redisClient *c = zmalloc(sizeof(*c));
+
+    anetNonBlock(NULL, fd);
+    anetTcpNoDelay(NULL, fd);
+    if (!c) return NULL;
+    c->fd = fd;
+    c->querybuf = sdsempty();
+    if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
+        readQueryFromClient, c) == AE_ERR) {
+        freeClient(c);
+        return NULL;
+    }
+    listAddNodeTail(server.clients, c);
+    return c;
+}
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd;
+    char cip[128];
+    redisClient *c;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(privdata);
+
+    cfd = anetAccept(server.neterr, fd, cip, &cport);
+    if (cfd == AE_ERR) {
+        redisLog(REDIS_VERBOSE, "Accepting client connection: %s", server.neterr);
+        return;
+    }
+    redisLog(REDIS_VERBOSE, "Accepted %s:%d", cip, cport);
+    if ((c = createClient(cfd)) == NULL) {
+        redisLog(REDIS_WARNING, "Error allocating resources for the client");
+        close(cfd); /* May be already closed, just ignore errors */
+        return;
+    }
+    /* If maxclient directive is set and this is one client more... close the
+     * connection. Note that we create the client instead to check before
+     * for this condition, since now the socket is already set in nonblocking
+     * mode and we can send an error for free using the Kernel I/O */
+    if (server.maxclients && listLength(server.clients) > server.maxclients) {
+        char *err = "-ERR max number of clients reached\r\n";
+
+        /* That's a best effort error message, don't check write errors */
+        if (write(c->fd, err, strlen(err)) == -1) {
+            /* Nothing to do, Just to avoid the warning... */
+        }
+        freeClient(c);
+        return;
+    }
+    server.stat_numconnections++;
 }
 
 /* =================================== Main! ================================ */
@@ -293,6 +557,8 @@ int main(int argc, char **argv) {
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
 #endif
-
+    redisLog(REDIS_NOTICE, "The server is now ready to accept connections on port %d", server.port);
+    aeMain(server.el);
+    aeDeleteEventLoop(server.el);
     return 0;
 }
