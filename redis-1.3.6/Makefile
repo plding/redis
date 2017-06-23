@@ -12,14 +12,19 @@ endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG?= -g -rdynamic -ggdb
 
+OBJ = redis.o zmalloc.o sds.o anet.o
 CLIOBJ = redis-cli.o zmalloc.o sds.o anet.o
 
+PROGRAM = redis-server
 CLIPROGRAM = redis-cli
 
-all: $(CLIPROGRAM)
+all: $(PROGRAM) $(CLIPROGRAM)
 
-redis-cli: $(CLIOBJ)
+$(PROGRAM): $(OBJ)
+	$(CC) -o $(PROGRAM) $(CCOPT) $(DEBUG) $(OBJ)
+
+$(CLIPROGRAM): $(CLIOBJ)
 	$(CC) -o $(CLIPROGRAM) $(CCOPT) $(DEBUG) $(CLIOBJ)
 
 clean:
-	rm -rf $(CLIPROGRAM) *.o
+	rm -rf $(PROGRAM) $(CLIPROGRAM) *.o
