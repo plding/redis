@@ -65,16 +65,25 @@ typedef struct aeFileEvent {
     void *clientData;
 } aeFileEvent;
 
+/* A fired event */
+typedef struct aeFiredEvent {
+    int fd;
+    int mask;
+} aeFiredEvent;
+
 /* State of an event based program */
 typedef struct aeEventLoop {
     int maxfd;
     aeFileEvent events[AE_SETSIZE]; /* Registered events */
-    aeFileEvent fired[AE_SETSIZE];  /* Fired events */
+    aeFiredEvent fired[AE_SETSIZE];  /* Fired events */
     int stop;
     void *apidata;  /* This is used for polling API specific data */
 } aeEventLoop;
 
 /* Prototypes */
 aeEventLoop *aeCreateEventLoop(void);
+int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
+        aeFileProc *proc, void *clientData);
+void aeMain(aeEventLoop *eventLoop);
 
 #endif  /* __AE_H__ */
