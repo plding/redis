@@ -57,6 +57,7 @@
 
 #include "redis.h"
 #include "ae.h"      /* Event driven programming library */
+#include "anet.h"    /* Networking the easy way */
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 
 /* Error codes */
@@ -77,10 +78,17 @@
 
 /*================================= Data types ============================== */
 
+/* With multiplexing we need to take per-client state.
+ * Clients are taken in a liked liste. */
+typedef struct redisClient {
+    int fd;
+} redisClient;
+
 /* Global server state structure */
 struct redisServer {
     int port;
     int fd;
+    char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
     int verbosity;
     int daemonize;
@@ -88,6 +96,10 @@ struct redisServer {
     char *logfile;
     char *bindaddr;
 };
+
+/*================================ Prototypes =============================== */
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
 /*================================= Globals ================================= */
 
@@ -112,13 +124,26 @@ static void redisLog(int level, const char *fmt, ...) {
         now = time(NULL);
         strftime(buf, sizeof(buf), "%d %b %H:%M:%S", localtime(&now));
         fprintf(fp, "[%d] %s %c ", (int) getpid(), buf, c[level]);
-        fprintf(fp, fmt, ap);
+        vfprintf(fp, fmt, ap);
         fprintf(fp, "\n");
         fflush(fp);
     }
     va_end(ap);
 
     if (server.logfile) fclose(fp);
+}
+
+/* ========================= Random utility functions ======================= */
+
+/* Redis generally does not try to recover from out of memory conditions
+ * when allocating objects or strings, it is not clear if it will be possible
+ * to report this condition to the client since the networking layer itself
+ * is based on heap allocation for send buffers, so we simply abort.
+ * At least the code will be simpler to read... */
+static void oom(const char *msg) {
+    redisLog(REDIS_WARNING, "%s: Out of memory\n", msg);
+    sleep(1);
+    abort();
 }
 
 static void initServerConfig(void) {
@@ -135,6 +160,44 @@ static void initServer(void) {
     signal(SIGPIPE, SIG_IGN);
 
     server.el = aeCreateEventLoop();
+    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    if (server.fd == -1) {
+        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
+        exit(1);
+    }
+    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+        acceptHandler, NULL) == AE_ERR) oom("creating file event");
+}
+
+static redisClient *createClient(int fd) {
+    redisClient *c = zmalloc(sizeof(*c));
+
+    anetNonBlock(NULL, fd);
+    anetTcpNoDelay(NULL, fd);
+    if (!c) return NULL;
+    c->fd = fd;
+    return c;
+}
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd;
+    char cip[128];
+    redisClient *c;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(privdata);
+
+    cfd = anetAccept(server.neterr, fd, cip, &cport);
+    if (cfd == ANET_ERR) {
+        redisLog(REDIS_VERBOSE, "Accepting client connection: %s", server.neterr);
+        return;
+    }
+    redisLog(REDIS_VERBOSE, "Accepted %s:%d", cip, cport);
+    if ((c = createClient(cfd)) == NULL) {
+        redisLog(REDIS_WARNING, "Error allocating resources for the client");
+        close(fd); /* May be already closed, just ignore errors */
+        return;
+    }
 }
 
 /* =================================== Main! ================================ */
