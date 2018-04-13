@@ -110,9 +110,9 @@ static void redisLog(int level, const char *fmt, ...) {
         time_t now;
 
         now = time(NULL);
-        strftime(buf, 64, "%b %H:%M:%S", localtime(&now));
+        strftime(buf, sizeof(buf), "%d %b %H:%M:%S", localtime(&now));
         fprintf(fp, "[%d] %s %c ", (int) getpid(), buf, c[level]);
-        vfprintf(fp, fmt, ap);
+        fprintf(fp, fmt, ap);
         fprintf(fp, "\n");
         fflush(fp);
     }
@@ -121,93 +121,31 @@ static void redisLog(int level, const char *fmt, ...) {
     if (server.logfile) fclose(fp);
 }
 
-static void initServerConfig() {
+static void initServerConfig(void) {
     server.port = REDIS_SERVERPORT;
     server.verbosity = REDIS_VERBOSE;
-    server.logfile = NULL;  /* NULL = log on standard output */
+    server.logfile = NULL; /* NULL = log on standard output */
     server.bindaddr = NULL;
     server.daemonize = 0;
     server.pidfile = "/var/run/redis.pid";
 }
 
-static void initServer() {
+static void initServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
 
     server.el = aeCreateEventLoop();
 }
 
-/* I agree, this is a very rudimental way to load a configuration...
-   will improve later if the config gets more complex */
-// static void loadServerConfig(char *filename) {
-//     FILE *fp;
-//     char buf[REDIS_CONFIG_MAX+1], *err = NULL;
-//     int linenum = 0;
-//     sds line = NULL;
-
-//     if (filename[0] == '-' && filename[1] == '\0')
-//         fp = stdin
-//     else {
-//         if ((fp = fopen(filename, "r")) == NULL) {
-//             redisLog(REDIS_WARNING, "Fatal error, can't open config file");
-//             exit(1);
-//         }
-//     }
-
-//     while (gets(buf, REDIS_CONFIG_MAX+1, fp) != NULL) {
-//         sds *argv;
-//         int argc, j;
-
-//         linenum++;
-//         line = sdsnew(buf);
-//         line = sdstrim(line, " \t\r\n");
-
-//         /* Skip comments and blank lines */
-//         if (line[0] == '#' || line[0] == '\0') {
-//             sdsfree(line);
-//             continue;
-//         }
-
-//         /* Split into arguments */
-//         argv = sdssplitlen(line, sdslen(line), " ", 1, &argc);
-//         sdstolower(argv[0]);
-
-//         /* Execute config directives */
-//         if (!strcasecmp(argv[0], "port") && argc == 2) {
-//             server.port = atoi(argv[1]);
-//             if (server.port < 1 || server.port > 65535) {
-//                 err = "Invalid port"; goto loaderr;
-//             }
-//         } else if (!strcasecmp(argv[0], "bind") && argc == 2) {
-//             server.bindaddr = zstrdup(argv[1]);
-//         } else {
-//             err = "Bad directive or wrong number of arguments"; goto loaderr;
-//         }
-//         for (j = 0; j < argc; j++)
-//             sdsfree(argv[j]);
-//         zfree(argv);
-//         sdsfree(line);
-//     }
-//     if (fp != stdin) fclose(fp);
-//     return;
-
-// loaderr:
-//     fprintf(stderr, "\n*** FATAL CONFIG FILE ERROR ***\n");
-//     fprintf(stderr, "Reading the configuration file, at line %d\n", linenum);
-//     fprintf(stderr, ">>> '%s'\n", line);
-//     fprintf(stderr, "%s\n", err);
-//     exit(1);
-// }
-
 /* =================================== Main! ================================ */
 
 #ifdef __linux__
-int linuxOvercommitMemoryValue(void) {
+static int linuxOvercommitMemoryValue(void) {
     FILE *fp = fopen("/proc/sys/vm/overcommit_memory", "r");
     char buf[64];
 
     if (!fp) return -1;
-    if (fgets(buf, 64, fp) == NULL) {
+    if (fgets(buf, sizeof(buf), fp) == NULL) {
         fclose(fp);
         return -1;
     }
@@ -216,9 +154,9 @@ int linuxOvercommitMemoryValue(void) {
     return atoi(buf);
 }
 
-void linuxOvercommitMemoryWarning(void) {
+static void linuxOvercommitMemoryWarning(void) {
     if (linuxOvercommitMemoryValue() == 0) {
-        redisLog(REDIS_WARNING, "WARNING overcommit_memory is set to 0! Background save may fail under low condition memory. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
+        redisLog(REDIS_WARNING, "WARNING overcommit_memory is set to 0! Background save may fail under low condition memory. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1'");
     }
 }
 #endif /* __linux__ */
@@ -233,7 +171,7 @@ static void daemonize(void) {
     /* Every output goes to /dev/null. If Redis is daemonized but
      * the 'logfile' is set to 'stdout' in the configuration file
      * it will not log at all. */
-    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
+    if ((fd = open("/dev/null", O_RDWR), 0) != -1) {
         dup2(fd, STDIN_FILENO);
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
@@ -242,15 +180,17 @@ static void daemonize(void) {
     /* Try to write the pid file */
     fp = fopen(server.pidfile, "w");
     if (fp) {
-        fprintf(fp, "%d\n", getpid());
+        fprintf(fp, "%d\n", (int) getpid());
         fclose(fp);
     }
 }
 
+/*============================ Utility functions ============================ */
+
 int main(int argc, char **argv) {
+    REDIS_NOTUSED(argv);
     initServerConfig();
     if (argc == 2) {
-        // loadServerConfig(argv[1]);
     } else if (argc > 2) {
         fprintf(stderr, "Usage: ./redis-server [/path/to/redis.conf]\n");
         exit(1);
