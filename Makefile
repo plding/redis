@@ -14,19 +14,32 @@ endif
 CCOPT = $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG ?= -g -rdynamic -ggdb
 
-all: ae.o zmalloc.o
-	$(MAKE) -C test
+OBJ = ae.o redis.o zmalloc.o
 
-ae.o: ae.c ae.h zmalloc.h config.h ae_select.c
+PRGNAME = redis-server
+
+all: redis-server
+
+# Deps (use make dep to generate this)
+ae.o: ae.c ae.h zmalloc.h config.h ae_epoll.c
+ae_epoll.o: ae_epoll.c
 ae_select.o: ae_select.c
+redis.o: redis.c fmacros.h config.h redis.h ae.h zmalloc.h
 zmalloc.o: zmalloc.c config.h
+
+redis-server: $(OBJ)
+	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ)
+	@echo ""
+	@echo "Hint: To run the test-redis.tcl script is a good idea."
+	@echo "Launch the redis server with ./redis-server, then in another"
+	@echo "terminal window enter this directory and run 'make test'."
+	@echo ""
 
 .c.o:
 	$(CC) -c $(CFLAGS) $(DEBUG) $(COMPILE_TIME) $<
 
 clean:
-	rm -rf *.o *.gcda *.gcno *.gcov
-	$(MAKE) -C test clean
+	rm -rf $(PRGNAME) *.o *.gcda *.gcno *.gcov
 
 dep:
 	$(CC) -MM *.c
