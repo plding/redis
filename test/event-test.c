@@ -51,7 +51,12 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
+#ifdef __linux
+    fd = open(fifo, O_RDWR | O_NONBLOCK);
+#else
     fd = open(fifo, O_RDONLY | O_NONBLOCK);
+#endif
+    
     if (fd < 0) {
         perror("open error");
         exit(EXIT_FAILURE);
