@@ -64,6 +64,8 @@ main(void)
 
     el = aeCreateEventLoop();
 
+    fprintf(stderr, "use api name: %s\n", aeGetApiName());
+
     aeCreateFileEvent(el, fd, AE_READABLE, fifo_read, NULL);
 
     aeMain(el);

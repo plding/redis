@@ -85,5 +85,6 @@ aeEventLoop *aeCreateEventLoop(void);
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData);
 void aeMain(aeEventLoop *eventLoop);
+char *aeGetApiName(void);
 
 #endif  /* __AE_H__ */

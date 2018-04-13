@@ -40,7 +40,13 @@
 #include "zmalloc.h"
 #include "config.h"
 
-#include "ae_select.c"
+/* Include the best multiplexing layer supported by this system.
+ * The following should be ordered by performances, descending. */
+#ifdef HAVE_EPOLL
+#include "ae_epoll.c"
+#else
+    #include "ae_select.c"
+#endif
 
 aeEventLoop *aeCreateEventLoop(void) {
     aeEventLoop *eventLoop;
@@ -148,4 +154,8 @@ void aeMain(aeEventLoop *eventLoop) {
     while (!eventLoop->stop) {
         aeProcessEvents(eventLoop, AE_ALL_EVENTS);
     }
+}
+
+char *aeGetApiName(void) {
+    return aeApiName();
 }
