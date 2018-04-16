@@ -65,7 +65,8 @@
 #define REDIS_ERR  -1
 
 /* Static server configuration */
-#define REDIS_SERVERPORT    6379    /* TCP port */
+#define REDIS_SERVERPORT        6379    /* TCP port */
+#define REDIS_IOBUF_LEN         1024
 
 /* Log levels */
 #define REDIS_DEBUG     0
@@ -99,7 +100,9 @@ struct redisServer {
 
 /*================================ Prototypes =============================== */
 
+static void freeClient(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
 
 /*================================= Globals ================================= */
 
@@ -169,6 +172,34 @@ static void initServer(void) {
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
 }
 
+static void freeClient(redisClient *c) {
+    close(c->fd);
+    zfree(c);
+}
+
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    redisClient *c = (redisClient *) privdata;
+    char buf[REDIS_IOBUF_LEN];
+    int nread;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+
+    nread = read(fd, buf, REDIS_IOBUF_LEN);
+    if (nread == -1) {
+        if (errno == EAGAIN) {
+            nread = 0;
+        } else {
+            redisLog(REDIS_VERBOSE, "Reading from client: %s", strerror(errno));
+            freeClient(c);
+            return;
+        }
+    } else if (nread == 0) {
+        redisLog(REDIS_VERBOSE, "Client closed connection");
+        freeClient(c);
+        return;
+    }
+}
+
 static redisClient *createClient(int fd) {
     redisClient *c = zmalloc(sizeof(*c));
 
@@ -176,6 +207,11 @@ static redisClient *createClient(int fd) {
     anetTcpNoDelay(NULL, fd);
     if (!c) return NULL;
     c->fd = fd;
+    if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
+        readQueryFromClient, c) == AE_ERR) {
+        freeClient(c);
+        return NULL;
+    }
     return c;
 }
 
