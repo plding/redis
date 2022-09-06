@@ -68,6 +68,7 @@
 
 #include "redis.h"
 #include "ae.h"     /* Event driven programming library */
+#include "sds.h"    /* Dynamic safe strings */
 #include "anet.h"   /* Networking the easy way */
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 
@@ -92,6 +93,8 @@
  * Clients are taken in a liked list. */
 typedef struct redisClient {
     int fd;
+    sds querybuf;
+    time_t lastinteraction; /* time of the last interaction, used for timeout */
 } redisClient;
 
 /* Global server state structure */
@@ -195,7 +198,8 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
         return;
     }
     if (nread) {
-
+        c->querybuf = sdscatlen(c->querybuf, buf, nread);
+        c->lastinteraction = time(NULL);
     } else {
         return;
     }
@@ -206,6 +210,8 @@ static redisClient *createClient(int fd) {
 
     if (!c) return NULL;
     c->fd = fd;
+    c->querybuf = sdsempty();
+    c->lastinteraction = time(NULL);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
         freeClient(c);

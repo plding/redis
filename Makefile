@@ -14,7 +14,7 @@ endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG?= -g -ggdb
 
-OBJ = ae.o anet.o redis.o zmalloc.o
+OBJ = ae.o anet.o redis.o sds.o zmalloc.o
 
 PRGNAME = redis-server
 
@@ -24,7 +24,8 @@ all: redis-server
 ae.o: ae.c ae.h zmalloc.h config.h ae_select.c
 ae_select.o: ae_select.c
 anet.o: anet.c fmacros.h anet.h
-redis.o: redis.c fmacros.h config.h redis.h ae.h anet.h
+redis.o: redis.c fmacros.h config.h redis.h ae.h sds.h anet.h zmalloc.h
+sds.o: sds.c sds.h zmalloc.h
 zmalloc.o: zmalloc.c config.h
 
 redis-server: $(OBJ)

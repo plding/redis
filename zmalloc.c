@@ -42,6 +42,9 @@
 
 #define increment_used_memory(_n) do { \
     if (zmalloc_thread_safe) { \
+        pthread_mutex_lock(&used_memory_mutex); \
+        used_memory += _n; \
+        pthread_mutex_unlock(&used_memory_mutex); \
     } else { \
         used_memory += _n; \
     } \
@@ -49,6 +52,9 @@
 
 #define decrement_used_memory(_n) do { \
     if (zmalloc_thread_safe) { \
+        pthread_mutex_lock(&used_memory_mutex); \
+        used_memory -= _n; \
+        pthread_mutex_unlock(&used_memory_mutex); \
     } else { \
         used_memory -= _n; \
     } \
@@ -56,6 +62,7 @@
 
 static size_t used_memory = 0;
 static int zmalloc_thread_safe = 0;
+pthread_mutex_t used_memory_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void zmalloc_oom(size_t size) {
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n",
@@ -78,6 +85,35 @@ void *zmalloc(size_t size) {
 #endif
 }
 
+void *zrealloc(void *ptr, size_t size) {
+#ifndef HAVE_MALLOC_SIZE
+    void *realptr;
+#endif
+    size_t oldsize;
+    void *newptr;
+
+    if (ptr == NULL) return zmalloc(size);
+#ifdef HAVE_MALLOC_SIZE
+    oldsize = redis_malloc_size(ptr);
+    newptr = realloc(ptr, size);
+    if (!newptr) zmalloc_oom(size);
+
+    decrement_used_memory(oldsize);
+    increment_used_memory(redis_malloc_size(newptr));
+    return newptr;
+#else
+    realptr = (char *) ptr - PREFIX_SIZE;
+    oldsize = *((size_t *) realptr);
+    newptr = remalloc(realptr, size + PREFIX_SIZE);
+    if (!newptr) zmalloc_oom(size);
+
+    *((size_t *) newptr) = size;
+    decrement_used_memory(oldsize);
+    increment_used_memory(size);
+    return (char *) newptr + PREFIX_SIZE;
+#endif
+}
+
 void zfree(void *ptr) {
 #ifndef HAVE_MALLOC_SIZE
     void *realptr;
@@ -96,10 +132,23 @@ void zfree(void *ptr) {
 #endif
 }
 
+char *zstrdup(const char *s) {
+    size_t l = strlen(s) + 1;
+    char *p = zmalloc(l);
+
+    memcpy(p, s, l);
+    return p;
+}
+
 size_t zmalloc_used_memory(void) {
     size_t um;
 
+    if (zmalloc_thread_safe) pthread_mutex_lock(&used_memory_mutex);
     um = used_memory;
-
+    if (zmalloc_thread_safe) pthread_mutex_unlock(&used_memory_mutex);
     return um;
+}
+
+void zmalloc_enable_thread_safeness(void) {
+    zmalloc_thread_safe = 1;
 }
