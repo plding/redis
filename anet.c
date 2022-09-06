@@ -92,3 +92,27 @@ int anetTcpServer(char *err, int port, char *bindaddr)
     }
     return s;
 }
+
+int anetAccept(char *err, int serversock, char *ip, int *port)
+{
+    int fd;
+    struct sockaddr_in sa;
+    unsigned int saLen;
+
+    while (1) {
+        saLen = sizeof(sa);
+        fd = accept(serversock, (struct sockaddr *) &sa, &saLen);
+        if (fd == -1) {
+            if (errno == EINTR)
+                continue;
+            else {
+                anetSetError(err, "accept: %s\n", strerror(errno));
+                return ANET_ERR;
+            }
+        }
+        break;
+    }
+    if (ip) strcpy(ip, inet_ntoa(sa.sin_addr));
+    if (port) *port = ntohs(sa.sin_port);
+    return fd;
+}

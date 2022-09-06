@@ -163,7 +163,15 @@ static void initServer() {
 }
 
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
-    redisLog(REDIS_DEBUG, "acceptHandler, fd:%d, mask:%d", fd, mask);
+    int cport, cfd;
+    char cip[128];
+
+    cfd = anetAccept(server.neterr, fd, cip, &cport);
+    if (cfd == ANET_ERR) {
+        redisLog(REDIS_VERBOSE, "Accepting client connection: %s", server.neterr);
+        return;
+    }
+    redisLog(REDIS_VERBOSE, "Accepted %s:%d", cip, cport);
 }
 
 int main(int argc, char **argv)

@@ -21,7 +21,8 @@ PRGNAME = redis-server
 all: redis-server
 
 # Deps (use make dep to generate this)
-ae.o: ae.c ae.h zmalloc.h config.h
+ae.o: ae.c ae.h zmalloc.h config.h ae_select.c
+ae_select.o: ae_select.c
 anet.o: anet.c fmacros.h anet.h
 redis.o: redis.c fmacros.h config.h redis.h ae.h anet.h
 zmalloc.o: zmalloc.c config.h

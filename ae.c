@@ -59,7 +59,7 @@ aeEventLoop *aeCreateEventLoop(void) {
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
     for (i = 0; i < AE_SETSIZE; i++)
-        eventLoop->events[i].mask;
+        eventLoop->events[i].mask = AE_NONE;
     return eventLoop;
 }
 

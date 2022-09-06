@@ -36,5 +36,6 @@
 #define ANET_ERR_LEN 256
 
 int anetTcpServer(char *err, int port, char *bindaddr);
+int anetAccept(char *err, int serversock, char *ip, int *port);
 
 #endif
