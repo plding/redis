@@ -163,6 +163,7 @@ static void initServer() {
 }
 
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    redisLog(REDIS_DEBUG, "acceptHandler, fd:%d, mask:%d", fd, mask);
 }
 
 int main(int argc, char **argv)
