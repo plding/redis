@@ -175,7 +175,18 @@ static void initServer() {
 }
 
 static void freeClient(redisClient *c) {
+
+    /* Note that if the client we are freeing is blocked into a blocking
+     * call, we have to set querybuf to NULL *before* to call
+     * unblockClientWaitingData() to avoid processInputBuffer() will get
+     * called. Also it is important to remove the file events after
+     * this, because this call adds the READABLE event. */
+    sdsfree(c->querybuf);
+    c->querybuf = NULL;
+
     close(c->fd);
+
+    zfree(c);
 }
 
 static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
