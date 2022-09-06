@@ -94,7 +94,9 @@
 typedef struct redisClient {
     int fd;
     sds querybuf;
+    int bulklen;            /* bulk read len. -1 if not in bulk read mode */
     time_t lastinteraction; /* time of the last interaction, used for timeout */
+    int flags;              /* REDIS_SLAVE | REDIS_MONITOR | REDIS_MULTI ... */
 } redisClient;
 
 /* Global server state structure */
@@ -219,9 +221,13 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
 static redisClient *createClient(int fd) {
     redisClient *c = zmalloc(sizeof(*c));
 
+    anetNonBlock(NULL, fd);
+    anetTcpNoDelay(NULL, fd);
     if (!c) return NULL;
     c->fd = fd;
     c->querybuf = sdsempty();
+    c->bulklen = -1;
+    c->flags = 0;
     c->lastinteraction = time(NULL);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
