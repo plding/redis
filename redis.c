@@ -79,6 +79,15 @@
 /* Static server configuration */
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_IOBUF_LEN         1024
+#define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
+
+/* Client flags */
+#define REDIS_SLAVE 1       /* This client is a slave server */
+#define REDIS_MASTER 2      /* This client is a master server */
+#define REDIS_MONITOR 4     /* This client is a slave monitor, see MONITOR */
+#define REDIS_MULTI 8       /* This client is in a MULTI context */
+#define REDIS_BLOCKED 16    /* The client is waiting in a blocking operation */
+#define REDIS_IO_WAIT 32    /* The client is waiting for Virtual Memory I/O */
 
 /* Log levels */
 #define REDIS_DEBUG 0
@@ -191,10 +200,56 @@ static void freeClient(redisClient *c) {
     zfree(c);
 }
 
+static void processInputBuffer(redisClient *c) {
+    /* Before to process the input buffer, make sure the client is not
+     * waitig for a blocking operation such as BLPOP. Note that the first
+     * iteration the client is never blocked, otherwise the processInputBuffer
+     * would not be called at all, but after the execution of the first commands
+     * in the input buffer the client may be blocked, and the "goto again"
+     * will try to reiterate. The following line will make it return asap. */
+    if (c->flags & REDIS_BLOCKED || c->flags & REDIS_IO_WAIT) return;
+    if (c->bulklen == -1) {
+        /* Read the first line of the query */
+        char *p = strchr(c->querybuf, '\n');
+        size_t querylen;
+
+        if (p) {
+            sds query, *argv;
+            int argc, j;
+
+            query = c->querybuf;
+            c->querybuf = sdsempty();
+            querylen = 1 + (p - query);
+            if (sdslen(query) > querylen) {
+                /* leave data after the first line of the query in the buffer */
+                c->querybuf = sdscatlen(c->querybuf, query + querylen, sdslen(query) - querylen);
+            }
+            *p = '\0'; /* remove "\n" */
+            if (*(p-1) == '\r') *(p-1) = '\0'; /* and "\r" if any */
+            // sdsupdatelen(query);
+
+            // /* Now we can split the query in arguments */
+            // argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
+            // sdsfree(query);
+
+            redisLog(REDIS_DEBUG, "query: %s", query);
+
+            // if (c->argv) zfree(c->argv);
+
+        } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
+            redisLog(REDIS_VERBOSE, "Client protocol error");
+            freeClient(c);
+            return;
+        }
+    }
+}
+
 static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *c = (redisClient*) privdata;
     char buf[REDIS_IOBUF_LEN];
     int nread;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
 
     nread = read(fd, buf, REDIS_IOBUF_LEN);
     if (nread == -1) {
@@ -216,6 +271,8 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     } else {
         return;
     }
+    if (!(c->flags & REDIS_BLOCKED))
+        processInputBuffer(c);
 }
 
 static redisClient *createClient(int fd) {
