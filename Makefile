@@ -12,16 +12,19 @@ else
   CCLINK?= -lm -lpthread
 endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
-DEBUG?= -g -rdynamic -ggdb
+DEBUG?= -g -ggdb
 
-OBJ = redis.o
+OBJ = ae.o anet.o redis.o zmalloc.o
 
 PRGNAME = redis-server
 
 all: redis-server
 
 # Deps (use make dep to generate this)
-redis.o: redis.c
+ae.o: ae.c ae.h zmalloc.h config.h
+anet.o: anet.c fmacros.h anet.h
+redis.o: redis.c fmacros.h config.h redis.h ae.h anet.h
+zmalloc.o: zmalloc.c config.h
 
 redis-server: $(OBJ)
 	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ)

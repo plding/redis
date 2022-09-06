@@ -29,11 +29,157 @@
 
 #define REDIS_VERSION "1.3.6"
 
+#include "fmacros.h"
+#include "config.h"
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#define __USE_POSIX199309
+#define __USE_UNIX98
+#include <signal.h>
+
+#ifdef HAVE_BACKTRACE
+#include <execinfo.h>
+#include <ucontext.h>
+#endif /* HAVE_BACKTRACE */
+
+#include <sys/wait.h>
+#include <errno.h>
+#include <assert.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <inttypes.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/uio.h>
+#include <limits.h>
+#include <math.h>
+#include <pthread.h>
+
+#if defined(__sun)
+#include "solarisfixes.h"
+#endif
+
+#include "redis.h"
+#include "ae.h"     /* Event driven programming library */
+#include "anet.h"   /* Networking the easy way */
+
+/* Error codes */
+#define REDIS_OK                0
+#define REDIS_ERR               -1
+
+/* Static server configuration */
+#define REDIS_SERVERPORT        6379    /* TCP port */
+
+/* Log levels */
+#define REDIS_DEBUG 0
+#define REDIS_VERBOSE 1
+#define REDIS_NOTICE 2
+#define REDIS_WARNING 3
+
+/* Anti-warning macro... */
+#define REDIS_NOTUSED(V) ((void) V)
+
+
+/* Global server state structure */
+struct redisServer {
+    int port;
+    int fd;
+    char neterr[ANET_ERR_LEN];
+    aeEventLoop *el;
+    /* Configuration */
+    int verbosity;
+    char *logfile;
+    char *bindaddr;
+};
+
+/*================================ Prototypes =============================== */
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+
+/*================================= Globals ================================= */
+
+/* Global vars */
+static struct redisServer server; /* server global state */
+
+/*============================ Utility functions ============================ */
+
+static void redisLog(int level, const char *fmt, ...) {
+    va_list ap;
+    FILE *fp;
+
+    fp = (server.logfile == NULL) ? stdout : fopen(server.logfile, "a");
+    if (!fp) return;
+
+    va_start(ap, fmt);
+    if (level >= server.verbosity) {
+        char *c = ".-*#";
+        char buf[64];
+        time_t now;
+
+        now = time(NULL);
+        strftime(buf, 64, "%d %b %H:%M:%S", localtime(&now));
+        fprintf(fp, "[%d] %s %c ", (int) getpid(), buf, c[level]);
+        vfprintf(fp, fmt, ap);
+        fprintf(fp, "\n");
+        fflush(fp);
+    }
+    va_end(ap);
+
+    if (server.logfile) fclose(fp);
+}
+
+/* ========================= Random utility functions ======================= */
+
+/* Redis generally does not try to recover from out of memory conditions
+ * when allocating objects or strings, it is not clear if it will be possible
+ * to report this condition to the client since the networking layer itself
+ * is based on heap allocation for send buffers, so we simply abort.
+ * At least the code will be simpler to read... */
+static void oom(const char *msg) {
+    redisLog(REDIS_WARNING, "%s: Out of memory\n",msg);
+    sleep(1);
+    abort();
+}
+
+static void initServerConfig() {
+    server.port = REDIS_SERVERPORT;
+    server.verbosity = REDIS_DEBUG;
+    server.logfile = NULL; /* NULL = log on standard output */
+    server.bindaddr = NULL;
+}
+
+static void initServer() {
+    server.el = aeCreateEventLoop();
+    server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+        acceptHandler, NULL) == AE_ERR) oom("creating file event");
+}
+
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+}
 
 int main(int argc, char **argv)
 {
-    printf("hello, redis!\n");
+    initServerConfig();
+    if (argc == 2) {
+
+    } else if (argc > 2) {
+        fprintf(stderr, "Usage: ./redis-server [/path/to/redis.conf]\n");
+        exit(1);
+    } else {
+        redisLog(REDIS_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
+    }
+    initServer();
+    redisLog(REDIS_NOTICE, "Server started, Redis version " REDIS_VERSION);
+    redisLog(REDIS_NOTICE, "The server is now ready to accept connections on port %d", server.port);
+    aeMain(server.el);
+    aeDeleteEventLoop(server.el);
     return 0;
 }
