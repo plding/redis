@@ -81,6 +81,30 @@
 #define REDIS_IOBUF_LEN         1024
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 
+/* Command flags */
+#define REDIS_CMD_BULK          1       /* Bulk write command */
+#define REDIS_CMD_INLINE        2       /* Inline command */
+/* REDIS_CMD_DENYOOM reserves a longer comment: all the commands marked with
+   this flags will return an error when the 'maxmemory' option is set in the
+   config file and the server is using more than maxmemory bytes of memory.
+   In short this commands are denied on low memory conditions. */
+#define REDIS_CMD_DENYOOM       4
+
+/* Object types */
+#define REDIS_STRING 0
+#define REDIS_LIST 1
+#define REDIS_SET 2
+#define REDIS_ZSET 3
+#define REDIS_HASH 4
+
+/* Objects encoding. Some kind of objects like Strings and Hashes can be
+ * internally represented in multiple ways. The 'encoding' field of the object
+ * is set to one of this fields for this object. */
+#define REDIS_ENCODING_RAW 0    /* Raw representation */
+#define REDIS_ENCODING_INT 1    /* Encoded as integer */
+#define REDIS_ENCODING_ZIPMAP 2 /* Encoded as zipmap */
+#define REDIS_ENCODING_HT 3     /* Encoded as an hash table */
+
 /* Client flags */
 #define REDIS_SLAVE 1       /* This client is a slave server */
 #define REDIS_MASTER 2      /* This client is a master server */
@@ -98,11 +122,23 @@
 /* Anti-warning macro... */
 #define REDIS_NOTUSED(V) ((void) V)
 
+/*================================= Data types ============================== */
+
+/* The actual Redis Object */
+typedef struct redisObject {
+    void *ptr;
+    unsigned char type;
+    unsigned char encoding;
+    int refcount;
+} robj;
+
 /* With multiplexing we need to take per-clinet state.
  * Clients are taken in a liked list. */
 typedef struct redisClient {
     int fd;
     sds querybuf;
+    robj **argv;
+    int argc;
     int bulklen;            /* bulk read len. -1 if not in bulk read mode */
     time_t lastinteraction; /* time of the last interaction, used for timeout */
     int flags;              /* REDIS_SLAVE | REDIS_MONITOR | REDIS_MULTI ... */
@@ -124,6 +160,9 @@ struct redisServer {
 
 /*================================ Prototypes =============================== */
 
+static robj *createObject(int type, void *ptr);
+static void freeClient(redisClient *c);
+static void processInputBuffer(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
 /*================================= Globals ================================= */
@@ -185,6 +224,10 @@ static void initServer() {
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
 }
 
+static void freeClientArgv(redisClient *c) {
+    c->argc = 0;
+}
+
 static void freeClient(redisClient *c) {
 
     /* Note that if the client we are freeing is blocked into a blocking
@@ -195,12 +238,44 @@ static void freeClient(redisClient *c) {
     sdsfree(c->querybuf);
     c->querybuf = NULL;
 
+    aeDeleteFileEvent(server.el, c->fd, AE_READABLE);
+    aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    freeClientArgv(c);
     close(c->fd);
-
+    zfree(c->argv);
     zfree(c);
 }
 
+/* resetClient prepare the client to process the next command */
+static void resetClient(redisClient *c) {
+    freeClientArgv(c);
+    c->bulklen = -1;
+    // c->multibulk = 0;
+}
+
+/* If this function gets called we already read a whole
+ * command, argments are in the client argv/argc fields.
+ * processCommand() execute the command or prepare the
+ * server for a bulk read from the client.
+ *
+ * If 1 is returned the client is still alive and valid and
+ * and other operations can be performed by the caller. Otherwise
+ * if 0 is returned the client was destroied (i.e. after QUIT). */
+static int processCommand(redisClient *c) {
+    /* The QUIT command is handled as a special case. Normal command
+     * procs are unable to close the client connection safely */
+    if (!strcasecmp(c->argv[0]->ptr, "quit")) {
+        freeClient(c);
+        return 0;
+    }
+
+    /* Prepare the client for the next command */
+    resetClient(c);
+    return 1;
+}
+
 static void processInputBuffer(redisClient *c) {
+again:
     /* Before to process the input buffer, make sure the client is not
      * waitig for a blocking operation such as BLPOP. Note that the first
      * iteration the client is never blocked, otherwise the processInputBuffer
@@ -226,16 +301,37 @@ static void processInputBuffer(redisClient *c) {
             }
             *p = '\0'; /* remove "\n" */
             if (*(p-1) == '\r') *(p-1) = '\0'; /* and "\r" if any */
-            // sdsupdatelen(query);
+            sdsupdatelen(query);
 
-            // /* Now we can split the query in arguments */
-            // argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
-            // sdsfree(query);
+            /* Now we can split the query in arguments */
+            argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
+            sdsfree(query);
 
-            redisLog(REDIS_DEBUG, "query: %s", query);
+            redisLog(REDIS_DEBUG, "argc: %d, argv: %s", argc, argv[0]);
 
-            // if (c->argv) zfree(c->argv);
+            if (c->argv) zfree(c->argv);
+            c->argv = zmalloc(sizeof(robj *) * argc);
 
+            for (j = 0; j < argc; j++) {
+                if (sdslen(argv[j])) {
+                    c->argv[c->argc] = createObject(REDIS_STRING, argv[j]);
+                    c->argc++;
+                } else {
+                    sdsfree(argv[j]);
+                }
+            }
+            zfree(argv);
+            if (c->argc) {
+                /* Execute the command. If the client is still valid
+                 * after processCommand() return and there is something
+                 * on the query buffer try to process the next command. */
+                if (processCommand(c) && sdslen(c->querybuf)) goto again;
+            } else {
+                /* Nothing to process, argc == 0. Just process the query
+                 * buffer if it's not empty or return to the caller */
+                if (sdslen(c->querybuf)) goto again;
+            }
+            return;
         } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
             redisLog(REDIS_VERBOSE, "Client protocol error");
             freeClient(c);
@@ -314,6 +410,19 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     server.stat_numconnections++;
+}
+
+/* ======================= Redis objects implementation ===================== */
+
+static robj *createObject(int type, void *ptr) {
+    robj *o = zmalloc(sizeof(*o));
+
+    o->type = type;
+    o->encoding = REDIS_ENCODING_RAW;
+    o->ptr = ptr;
+    o->refcount = 1;
+
+    return o;
 }
 
 int main(int argc, char **argv)

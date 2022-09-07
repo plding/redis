@@ -56,6 +56,9 @@ struct aeEventLoop;
 
 /* Types and data structures */
 typedef void aeFileProc(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);
+typedef int aeTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
+typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientData);
+typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 
 /* File event structure */
 typedef struct aeFileEvent {
@@ -64,6 +67,17 @@ typedef struct aeFileEvent {
     aeFileProc *wfileProc;
     void *clientData;
 } aeFileEvent;
+
+/* Time event structure */
+typedef struct aeTimeEvent {
+    long long id; /* time event identifier. */
+    long when_sec; /* seconds */
+    long when_ms; /* milliseconds */
+    aeTimeProc *timeProc;
+    aeEventFinalizerProc *finalizerProc;
+    void *clientData;
+    struct aeTimeEvent *next;
+} aeTimeEvent;
 
 /* A fired event */
 typedef struct aeFiredEvent {
@@ -74,10 +88,13 @@ typedef struct aeFiredEvent {
 /* State of an event based program */
 typedef struct aeEventLoop {
     int maxfd;
+    long long timeEventNextId;
     aeFileEvent events[AE_SETSIZE]; /* Registered events */
     aeFiredEvent fired[AE_SETSIZE]; /* Fired events */
+    aeTimeEvent *timeEventHead;
     int stop;
     void *apidata; /* This is used for polling API specific data */
+    aeBeforeSleepProc *beforesleep;
 } aeEventLoop;
 
 /* Prototypes */
@@ -86,6 +103,15 @@ void aeDeleteEventLoop(aeEventLoop *eventLoop);
 void aeStop(aeEventLoop *eventLoop);
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData);
+void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask);
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
+        aeTimeProc *proc, void *clientData,
+        aeEventFinalizerProc *finalizerProc);
+int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id);
+int aeProcessEvents(aeEventLoop *eventLoop, int flags);
+int aeWait(int fd, int mask, long long milliseconds);
 void aeMain(aeEventLoop *eventLoop);
+char *aeGetApiName(void);
+void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep);
 
 #endif

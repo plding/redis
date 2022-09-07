@@ -88,6 +88,24 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     return AE_OK;
 }
 
+void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
+{
+    if (fd >= AE_SETSIZE) return;
+    aeFileEvent *fe = &eventLoop->events[fd];
+
+    if (fe->mask == AE_NONE) return;
+    fe->mask = fe->mask & (~mask);
+    if (fd == eventLoop->maxfd && fe->mask == AE_NONE) {
+        /* Update the max fd */
+        int j;
+
+        for (j = eventLoop->maxfd - 1; j >= 0; j--)
+            if (eventLoop->events[j].mask != AE_NONE) break;
+        eventLoop->maxfd = j;
+    }
+    aeApiDelEvent(eventLoop, fd, mask);
+}
+
 /* Process every pending time event, then every pending file event
  * (that may be registered by time event callbacks just processed).
  * Without special flags the function sleeps until some file event
