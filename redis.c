@@ -70,6 +70,7 @@
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
 #include "anet.h"   /* Networking the easy way */
+#include "dict.h"   /* Hash tables */
 #include "adlist.h" /* Linked lists */
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 
@@ -80,6 +81,7 @@
 /* Static server configuration */
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_IOBUF_LEN         1024
+#define REDIS_DEFAULT_DBNUM     1
 #define REDIS_MAX_WRITE_PER_EVENT (1024*64)
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 
@@ -138,6 +140,14 @@ typedef struct redisObject {
     int refcount;
 } robj;
 
+typedef struct redisDb {
+    dict *dict;                 /* The keyspace for this DB */
+    dict *expires;              /* Timeout of keys with a timeout set */
+    dict *blockingkeys;         /* Keys with clients waiting for data (BLPOP) */
+    dict *io_keys;              /* Keys with clients waiting for VM I/O */
+    int id;
+} redisDb;
+
 /* With multiplexing we need to take per-clinet state.
  * Clients are taken in a liked list. */
 typedef struct redisClient {
@@ -156,14 +166,18 @@ typedef struct redisClient {
 struct redisServer {
     int port;
     int fd;
+    redisDb *db;
     list *clients;
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
     int cronloops;              /* number of times the cron function run */
     /* Fields used only for stats */
+    time_t stat_starttime;         /* server start time */
+    long long stat_numcommands;    /* number of processed commands */
     long long stat_numconnections; /* number of connections received */
     /* Configuration */
     int verbosity;
+    int dbnum;
     char *logfile;
     char *bindaddr;
 };
@@ -251,6 +265,50 @@ static void redisLog(int level, const char *fmt, ...) {
     if (server.logfile) fclose(fp);
 }
 
+/*====================== Hash table type implementation  ==================== */
+
+static int sdsDictKeyCompare(void *privdata, const void *key1,
+        const void *key2)
+{
+    int l1, l2;
+    DICT_NOTUSED(privdata);
+
+    l1 = sdslen((sds) key1);
+    l2 = sdslen((sds) key2);
+    if (l1 != l2) return 0;
+    return memcmp(key1, key2, l1) == 0;
+}
+
+static void dictRedisObjectDestructor(void *privdata, void *val)
+{
+    DICT_NOTUSED(privdata);
+
+    if (val == NULL) return; /* Values of swapped out keys as set to NULL */
+    decrRefCount(val);
+}
+
+static int dictObjKeyCompare(void *privdata, const void *key1,
+        const void *key2)
+{
+    const robj *o1 = key1, *o2 = key2;
+    return sdsDictKeyCompare(privdata, o1->ptr, o2->ptr);
+}
+
+static unsigned int dictObjHash(const void *key) {
+    const robj *o = key;
+    return dictGenHashFunction(o->ptr, sdslen(o->ptr));
+}
+
+/* Db->dict */
+static dictType dbDictType = {
+    dictObjHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictObjKeyCompare,          /* key compare */
+    dictRedisObjectDestructor,  /* key destructor */
+    dictRedisObjectDestructor   /* val destructor */
+};
+
 /* ========================= Random utility functions ======================= */
 
 /* Redis generally does not try to recover from out of memory conditions
@@ -270,6 +328,23 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
     REDIS_NOTUSED(id);
     REDIS_NOTUSED(clientData);
 
+    /* We take a cached value of the unix time in the global state because
+     * with virtual memory and aging there is to store the current time
+     * in objects at every object access, and accuracy is not needed.
+     * To access a global var is faster than calling time(NULL) */
+    // server.unixtime = time(NULL);
+
+    /* Show some info about non-empty databases */
+    for (j = 0; j < server.dbnum; j++) {
+        long long size, used;
+
+        size = dictSlots(server.db[j].dict);
+        used = dictSize(server.db[j].dict);
+        if (!(loops % 5)) {
+            redisLog(REDIS_VERBOSE, "DB %d: %lld keys in %lld slots HT.", j, used, size);
+        }
+    }
+
     /* Show information about connected clients */
     if (!(loops % 5)) {
         redisLog(REDIS_VERBOSE, "%d clients connected, %zu bytes in use",
@@ -285,6 +360,7 @@ static void createSharedObjects(void) {
 }
 
 static void initServerConfig() {
+    server.dbnum = REDIS_DEFAULT_DBNUM;
     server.port = REDIS_SERVERPORT;
     server.verbosity = REDIS_DEBUG;
     server.logfile = NULL; /* NULL = log on standard output */
@@ -292,14 +368,28 @@ static void initServerConfig() {
 }
 
 static void initServer() {
+    int j;
+
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
 
     server.clients = listCreate();
     createSharedObjects();
     server.el = aeCreateEventLoop();
+    server.db = zmalloc(sizeof(redisDb) * server.dbnum);
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    if (server.fd == -1) {
+        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
+        exit(1);
+    }
+    for (j = 0; j < server.dbnum; j++) {
+        server.db[j].dict = dictCreate(&dbDictType, NULL);
+        server.db[j].id = j;
+    }
     server.cronloops = 0;
+    server.stat_numcommands = 0;
+    server.stat_numconnections = 0;
+    server.stat_starttime = time(NULL);
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
