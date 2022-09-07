@@ -140,3 +140,143 @@ int _dictInit(dict *ht, dictType *type,
     ht->privdata = privDataPtr;
     return DICT_OK;
 }
+
+/* Expand or create the hashtable */
+int dictExpand(dict *ht, unsigned long size)
+{
+    dict n; /* the new hashtable */
+    unsigned long realsize = _dictNextPower(size), i;
+
+    /* the size is invalid if it is smaller than the number of
+     * elements already inside the hashtable */
+    if (ht->used > size)
+        return DICT_ERR;
+    
+    _dictInit(&n, ht->type, ht->privdata);
+    n.size = realsize;
+    n.sizemask = realsize - 1;
+    n.table = _dictAlloc(realsize * sizeof(dictEntry *));
+
+    /* Initialize all the pointers to NULL */
+    memset(n.table, 0, realsize * sizeof(dictEntry *));
+
+    /* Copy all the elements from the old to the new table:
+     * note that if the old hash table is empty ht->size is zero,
+     * so dictExpand just creates an hash table. */
+    n.used = ht->used;
+    for (i = 0; i < ht->size && ht->used > 0; i++) {
+        dictEntry *he, *nextHe;
+
+        if (ht->table[i] == NULL) continue;
+
+        /* For each hash entry on this slot... */
+        he = ht->table[i];
+        while (he) {
+            unsigned int h;
+
+            nextHe = he->next;
+            /* Get the new element index */
+            h = dictHashKey(ht, he->key) & n.sizemask;
+            he->next = n.table[h];
+            n.table[h] = he;
+            ht->used--;
+            /* Pass to the next element */
+            he = nextHe;
+        }
+    }
+    assert(ht->used == 0);
+    _dictFree(ht->table);
+
+    /* Remap the new hashtable in the old */
+    *ht = n;
+    return DICT_OK;
+}
+
+/* Add an element to the target hash table */
+int dictAdd(dict *ht, void *key, void *val)
+{
+    int index;
+    dictEntry *entry;
+
+    /* Get the index of the new element, or -1 if
+     * the element already exists. */
+    if ((index = _dictKeyIndex(ht, key)) == -1)
+        return DICT_ERR;
+
+    /* Allocates the memory and stores key */
+    entry = _dictAlloc(sizeof(*entry));
+    entry->next = ht->table[index];
+    ht->table[index] = entry;
+
+    /* Set the hash entry fields. */
+    dictSetHashKey(ht, entry, key);
+    dictSetHashVal(ht, entry, val);
+    ht->used++;
+    return DICT_OK;
+}
+
+dictEntry *dictFind(dict *ht, const void *key)
+{
+    dictEntry *he;
+    unsigned int h;
+
+    if (ht->size == 0) return NULL;
+    h = dictHashKey(ht, key) & ht->sizemask;
+    he = ht->table[h];
+    while (he) {
+        if (dictCompareHashKeys(ht, key, he->key))
+            return he;
+        he = he->next;
+    }
+    return NULL;
+}
+
+/* ------------------------- private functions ------------------------------ */
+
+/* Expand the hash table if needed */
+static int _dictExpandIfNeeded(dict *ht)
+{
+    /* If the hash table is empty expand it to the intial size,
+     * if the table is "full" dobule its size. */
+    if (ht->size == 0)
+        return dictExpand(ht, DICT_HT_INITIAL_SIZE);
+    if (ht->used == ht->size)
+        return dictExpand(ht, ht->size * 2);
+    return DICT_OK;
+}
+
+/* Our hash table capability is a power of two */
+static unsigned long _dictNextPower(unsigned long size)
+{
+    unsigned long i = DICT_HT_INITIAL_SIZE;
+
+    if (size >= LONG_MAX) return LONG_MAX;
+    while (1) {
+        if (i >= size)
+            return i;
+        i *= 2;
+    }
+}
+
+/* Returns the index of a free slot that can be populated with
+ * an hash entry for the given 'key'.
+ * If the key already exists, -1 is returned. */
+static int _dictKeyIndex(dict *ht, const void *key)
+{
+    unsigned int h;
+    dictEntry *he;
+
+    /* Expand the hashtable if needed */
+    if (_dictExpandIfNeeded(ht) == DICT_ERR)
+        return -1;
+    /* Compute the key hash value */
+    h = dictHashKey(ht, key) & ht->sizemask;
+    /* Search if this slot does not already contain the given key */
+    he = ht->table[h];
+    while (he) {
+        if (dictCompareHashKeys(ht, key, he->key))
+            return -1;
+        he = he->next;
+    }
+    return h;
+}

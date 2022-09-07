@@ -152,6 +152,7 @@ typedef struct redisDb {
  * Clients are taken in a liked list. */
 typedef struct redisClient {
     int fd;
+    redisDb *db;
     sds querybuf;
     robj **argv;
     int argc;
@@ -228,12 +229,16 @@ static void call(redisClient *c, struct redisCommand *cmd);
 static void resetClient(redisClient *c);
 
 static void pingCommand(redisClient *c);
+static void setCommand(redisClient *c);
+static void getCommand(redisClient *c);
 
 /*================================= Globals ================================= */
 
 /* Global vars */
 static struct redisServer server; /* server global state */
 static struct redisCommand cmdTable[] = {
+    {"get", getCommand, 2, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {"set", setCommand, 3, REDIS_CMD_BULK|REDIS_CMD_DENYOOM, NULL, 0, 0, 0},
     {"ping", pingCommand, 1, REDIS_CMD_INLINE, NULL, 0, 0, 0},
     {NULL, NULL, 0, 0, NULL, 0, 0, 0}
 };
@@ -356,6 +361,15 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 }
 
 static void createSharedObjects(void) {
+    shared.crlf = createObject(REDIS_STRING, sdsnew("\r\n"));
+    shared.ok = createObject(REDIS_STRING, sdsnew("+OK\r\n"));
+    shared.err = createObject(REDIS_STRING, sdsnew("-ERR\r\n"));
+    shared.emptybulk = createObject(REDIS_STRING, sdsnew("$0\r\n\r\n"));
+    shared.czero = createObject(REDIS_STRING, sdsnew(":0\r\n"));
+    shared.cone = createObject(REDIS_STRING, sdsnew(":1\r\n"));
+    shared.nullbulk = createObject(REDIS_STRING, sdsnew("$-1\r\n"));
+    shared.nullmultibulk = createObject(REDIS_STRING, sdsnew("*-1\r\n"));
+    shared.emptymultibulk = createObject(REDIS_STRING, sdsnew("*0\r\n"));
     shared.pong = createObject(REDIS_STRING, sdsnew("+PONG\r\n"));
 }
 
@@ -628,12 +642,20 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
         processInputBuffer(c);
 }
 
+static int selectDb(redisClient *c, int id) {
+    if (id < 0 || id >= server.dbnum)
+        return REDIS_ERR;
+    c->db = &server.db[id];
+    return DICT_OK;
+}
+
 static redisClient *createClient(int fd) {
     redisClient *c = zmalloc(sizeof(*c));
 
     anetNonBlock(NULL, fd);
     anetTcpNoDelay(NULL, fd);
     if (!c) return NULL;
+    selectDb(c, 0);
     c->fd = fd;
     c->querybuf = sdsempty();
     c->argc = 0;
@@ -664,6 +686,21 @@ static void addReplySds(redisClient *c, sds s) {
     robj *o = createObject(REDIS_STRING, s);
     addReply(c, o);
     decrRefCount(o);
+}
+
+static void addReplyBulkLen(redisClient *c, robj *obj) {
+    size_t len;
+
+    if (obj->encoding == REDIS_ENCODING_RAW) {
+        len = sdslen(obj->ptr);
+    }
+    addReplySds(c, sdscatprintf(sdsempty(), "$%lu\r\n", (unsigned long) len));
+}
+
+static void addReplyBulk(redisClient *c, robj *obj) {
+    addReplyBulkLen(c, obj);
+    addReply(c, obj);
+    addReply(c, shared.crlf);
 }
 
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -723,6 +760,28 @@ static void decrRefCount(void *obj) {
     }
 }
 
+static robj *lookupKey(redisDb *db, robj *key) {
+    dictEntry *de = dictFind(db->dict, key);
+    if (de) {
+        robj *key = dictGetEntryKey(de);
+        robj *val = dictGetEntryVal(de);
+
+        return val;
+    } else {
+        return NULL;
+    }
+}
+
+static robj *lookupKeyRead(redisDb *db, robj *key) {
+    return lookupKey(db, key);
+}
+
+static robj *lookupKeyReadOrReply(redisClient *c, robj *key, robj *reply) {
+    robj *o = lookupKeyRead(c->db, key);
+    if (!o) addReply(c, reply);
+    return o;
+}
+
 /* Get a decoded version of an encoded object (returned as a new object).
  * If the object is already raw-encoded just increment the ref count. */
 static robj *getDecodedObject(robj *o) {
@@ -737,6 +796,40 @@ static robj *getDecodedObject(robj *o) {
 
 static void pingCommand(redisClient *c) {
     addReply(c, shared.pong);
+}
+
+/*=================================== Strings =============================== */
+
+static void setGenericCommand(redisClient *c, int nx) {
+    int retval;
+
+    retval = dictAdd(c->db->dict, c->argv[1], c->argv[2]);
+    if (retval == DICT_ERR) {
+        addReply(c, shared.czero);
+        return;
+    } else {
+        incrRefCount(c->argv[1]);
+        incrRefCount(c->argv[2]);
+    }
+    addReply(c, shared.ok);
+}
+
+static void setCommand(redisClient *c) {
+    setGenericCommand(c, 0);
+}
+
+static int getGenericCommand(redisClient *c) {
+    robj *o;
+
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL)
+        return REDIS_OK;
+    
+    addReplyBulk(c, o);
+    return REDIS_OK;
+}
+
+static void getCommand(redisClient *c) {
+    getGenericCommand(c);
 }
 
 static void _redisAssert(char *estr, char *file, int line) {
