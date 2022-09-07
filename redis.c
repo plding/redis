@@ -80,6 +80,7 @@
 /* Static server configuration */
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_IOBUF_LEN         1024
+#define REDIS_MAX_WRITE_PER_EVENT (1024*64)
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 
 /* Command flags */
@@ -145,6 +146,8 @@ typedef struct redisClient {
     robj **argv;
     int argc;
     int bulklen;            /* bulk read len. -1 if not in bulk read mode */
+    list *reply;
+    int sentlen;
     time_t lastinteraction; /* time of the last interaction, used for timeout */
     int flags;              /* REDIS_SLAVE | REDIS_MONITOR | REDIS_MULTI ... */
 } redisClient;
@@ -165,20 +168,57 @@ struct redisServer {
     char *bindaddr;
 };
 
+typedef void redisCommandProc(redisClient *c);
+struct redisCommand {
+    char *name;
+    redisCommandProc *proc;
+    int arity;
+    int flags;
+    /* Use a function to determine which keys need to be loaded
+     * in the background prior to executing this command. Takes precedence
+     * over vm_firstkey and others, ignored when NULL */
+    redisCommandProc *vm_preload_proc;
+    /* What keys should be loaded in background when calling this command? */
+    int vm_firstkey; /* The first argument that's a key (0 = no keys) */
+    int vm_lastkey;  /* THe last argument that's a key */
+    int vm_keystep;  /* The step between first and last key */
+};
+
+/* Our shared "common" objects */
+
+struct sharedObjectsStruct {
+    robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
+    *colon, *nullbulk, *nullmultibulk, *queued,
+    *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
+    *outofrangeerr, *plus,
+    *select0, *select1, *select2, *select3, *select4,
+    *select5, *select6, *select7, *select8, *select9;
+} shared;
+
 /*================================ Prototypes =============================== */
 
 static void freeStringObject(robj *o);
 static void decrRefCount(void *o);
 static robj *createObject(int type, void *ptr);
 static void freeClient(redisClient *c);
+static void addReply(redisClient *c, robj *obj);
+static void addReplySds(redisClient *c, sds s);
 static void incrRefCount(robj *o);
+static robj *getDecodedObject(robj *o);
+static int processCommand(redisClient *c);
 static void processInputBuffer(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+
+static void pingCommand(redisClient *c);
 
 /*================================= Globals ================================= */
 
 /* Global vars */
 static struct redisServer server; /* server global state */
+static struct redisCommand cmdTable[] = {
+    {"ping", pingCommand, 1, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {NULL, NULL, 0, 0, NULL, 0, 0, 0}
+};
 
 /*============================ Utility functions ============================ */
 
@@ -236,6 +276,10 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
     return 1000;
 }
 
+static void createSharedObjects(void) {
+    shared.pong = createObject(REDIS_STRING, sdsnew("+PONG\r\n"));
+}
+
 static void initServerConfig() {
     server.port = REDIS_SERVERPORT;
     server.verbosity = REDIS_DEBUG;
@@ -248,6 +292,7 @@ static void initServer() {
     signal(SIGPIPE, SIG_IGN);
 
     server.clients = listCreate();
+    createSharedObjects();
     server.el = aeCreateEventLoop();
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
     server.cronloops = 0;
@@ -287,11 +332,75 @@ static void freeClient(redisClient *c) {
     zfree(c);
 }
 
+static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    redisClient *c = privdata;
+    int nwritten = 0, totwritten = 0, objlen;
+    robj *o;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+
+    while (listLength(c->reply)) {
+        o = listNodeValue(listFirst(c->reply));
+        objlen = sdslen(o->ptr);
+
+        if (objlen == 0) {
+            listDelNode(c->reply, listFirst(c->reply));
+            continue;
+        }
+
+        nwritten = write(fd, (char *) o->ptr + c->sentlen, objlen - c->sentlen);
+        if (nwritten <= 0) break;
+
+        c->sentlen += nwritten;
+        totwritten += nwritten;
+        /* If we fully sent the object on head go to the next one */
+        if (c->sentlen == objlen) {
+            listDelNode(c->reply, listFirst(c->reply));
+            c->sentlen = 0;
+        }
+        /* Note that we avoid to send more thank REDIS_MAX_WRITE_PER_EVENT
+         * bytes, in a single threaded server it's a good idea to serve
+         * other clients as well, even if a very large request comes from
+         * super fast link that is always able to accept data (in real world
+         * scenario think about 'KEYS *' against the loopback interfae) */
+        if (totwritten > REDIS_MAX_WRITE_PER_EVENT) break;
+    }
+    if (nwritten == -1) {
+        if (errno == EAGAIN) {
+            nwritten = 0;
+        } else {
+            redisLog(REDIS_VERBOSE,
+                "Error writing to client: %s", strerror(errno));
+            freeClient(c);
+            return;
+        }
+    }
+    if (totwritten > 0) c->lastinteraction = time(NULL);
+    if (listLength(c->reply) == 0) {
+        c->sentlen = 0;
+        aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    }
+}
+
+static struct redisCommand *lookupCommand(char *name) {
+    int j;
+    while (cmdTable[j].name != NULL) {
+        if (!strcasecmp(name, cmdTable[j].name)) return &cmdTable[j];
+        j++;
+    }
+    return NULL;
+}
+
 /* resetClient prepare the client to process the next command */
 static void resetClient(redisClient *c) {
     freeClientArgv(c);
     c->bulklen = -1;
     // c->multibulk = 0;
+}
+
+/* Call() is the core of Redis execution of a command */
+static void call(redisClient *c, struct redisCommand *cmd) {
+    cmd->proc(c);
 }
 
 /* If this function gets called we already read a whole
@@ -303,12 +412,27 @@ static void resetClient(redisClient *c) {
  * and other operations can be performed by the caller. Otherwise
  * if 0 is returned the client was destroied (i.e. after QUIT). */
 static int processCommand(redisClient *c) {
+    struct redisCommand *cmd;
+
     /* The QUIT command is handled as a special case. Normal command
      * procs are unable to close the client connection safely */
     if (!strcasecmp(c->argv[0]->ptr, "quit")) {
         freeClient(c);
         return 0;
     }
+
+    /* Now lookup the command and check ASAP about trivial error conditions
+     * such wrong arity, bad command name and so forth. */
+    cmd = lookupCommand(c->argv[0]->ptr);
+    if (!cmd) {
+        addReplySds(c,
+            sdscatprintf(sdsempty(), "-ERR unknown command '%s'\r\n",
+                (char *) c->argv[0]->ptr));
+        resetClient(c);
+        return 1;
+    }
+
+    call(c, cmd);
 
     /* Prepare the client for the next command */
     resetClient(c);
@@ -418,9 +542,14 @@ static redisClient *createClient(int fd) {
     if (!c) return NULL;
     c->fd = fd;
     c->querybuf = sdsempty();
+    c->argc = 0;
+    c->argv = NULL;
     c->bulklen = -1;
+    c->sentlen = 0;
     c->flags = 0;
     c->lastinteraction = time(NULL);
+    c->reply = listCreate();
+    listSetFreeMethod(c->reply, decrRefCount);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
         freeClient(c);
@@ -428,6 +557,19 @@ static redisClient *createClient(int fd) {
     }
     listAddNodeTail(server.clients, c);
     return c;
+}
+
+static void addReply(redisClient *c, robj *obj) {
+    if (listLength(c->reply) == 0 &&
+        aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+            sendReplyToClient, c) == AE_ERR) return;
+    listAddNodeTail(c->reply, getDecodedObject(obj));
+}
+
+static void addReplySds(redisClient *c, sds s) {
+    robj *o = createObject(REDIS_STRING, s);
+    addReply(c, o);
+    decrRefCount(o);
 }
 
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -485,6 +627,22 @@ static void decrRefCount(void *obj) {
         default: redisAssert(0); break;
         }
     }
+}
+
+/* Get a decoded version of an encoded object (returned as a new object).
+ * If the object is already raw-encoded just increment the ref count. */
+static robj *getDecodedObject(robj *o) {
+    if (o->encoding == REDIS_ENCODING_RAW) {
+        incrRefCount(o);
+        return o;
+    }
+    return o;
+}
+
+/*================================== Commands =============================== */
+
+static void pingCommand(redisClient *c) {
+    addReply(c, shared.pong);
 }
 
 static void _redisAssert(char *estr, char *file, int line) {
