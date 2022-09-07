@@ -70,6 +70,7 @@
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
 #include "anet.h"   /* Networking the easy way */
+#include "adlist.h" /* Linked lists */
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 
 /* Error codes */
@@ -122,6 +123,10 @@
 /* Anti-warning macro... */
 #define REDIS_NOTUSED(V) ((void) V)
 
+/* We can print the stacktrace, so our assert is defined this way: */
+#define redisAssert(_e) ((_e) ? (void) 0 : (_redisAssert(#_e, __FILE__, __LINE__), _exit(1)))
+static void _redisAssert(char *estr, char *file, int line);
+
 /*================================= Data types ============================== */
 
 /* The actual Redis Object */
@@ -148,8 +153,10 @@ typedef struct redisClient {
 struct redisServer {
     int port;
     int fd;
+    list *clients;
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
+    int cronloops;              /* number of times the cron function run */
     /* Fields used only for stats */
     long long stat_numconnections; /* number of connections received */
     /* Configuration */
@@ -160,8 +167,11 @@ struct redisServer {
 
 /*================================ Prototypes =============================== */
 
+static void freeStringObject(robj *o);
+static void decrRefCount(void *o);
 static robj *createObject(int type, void *ptr);
 static void freeClient(redisClient *c);
+static void incrRefCount(robj *o);
 static void processInputBuffer(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
@@ -211,7 +221,18 @@ static void oom(const char *msg) {
 }
 
 static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    redisLog(REDIS_VERBOSE, "%zu bytes in use", zmalloc_used_memory());
+    int j, loops = server.cronloops++;
+    REDIS_NOTUSED(eventLoop);
+    REDIS_NOTUSED(id);
+    REDIS_NOTUSED(clientData);
+
+    /* Show information about connected clients */
+    if (!(loops % 5)) {
+        redisLog(REDIS_VERBOSE, "%d clients connected, %zu bytes in use",
+            listLength(server.clients),
+            zmalloc_used_memory());
+    }
+    
     return 1000;
 }
 
@@ -223,18 +244,28 @@ static void initServerConfig() {
 }
 
 static void initServer() {
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    server.clients = listCreate();
     server.el = aeCreateEventLoop();
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    server.cronloops = 0;
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
 }
 
 static void freeClientArgv(redisClient *c) {
+    int j;
+
+    for (j = 0; j < c->argc; j++)
+        decrRefCount(c->argv[j]);
     c->argc = 0;
 }
 
 static void freeClient(redisClient *c) {
+    listNode *ln;
 
     /* Note that if the client we are freeing is blocked into a blocking
      * call, we have to set querybuf to NULL *before* to call
@@ -248,6 +279,10 @@ static void freeClient(redisClient *c) {
     aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
     freeClientArgv(c);
     close(c->fd);
+    /* Remove from the list of clients */
+    ln = listSearchKey(server.clients, c);
+    redisAssert(ln != NULL);
+    listDelNode(server.clients, ln);
     zfree(c->argv);
     zfree(c);
 }
@@ -312,8 +347,6 @@ again:
             /* Now we can split the query in arguments */
             argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
             sdsfree(query);
-
-            redisLog(REDIS_DEBUG, "argc: %d, argv: %s", argc, argv[0]);
 
             if (c->argv) zfree(c->argv);
             c->argv = zmalloc(sizeof(robj *) * argc);
@@ -393,6 +426,7 @@ static redisClient *createClient(int fd) {
         freeClient(c);
         return NULL;
     }
+    listAddNodeTail(server.clients, c);
     return c;
 }
 
@@ -430,6 +464,39 @@ static robj *createObject(int type, void *ptr) {
 
     return o;
 }
+
+static void freeStringObject(robj *o) {
+    if (o->encoding == REDIS_ENCODING_RAW) {
+        sdsfree(o->ptr);
+    }
+}
+
+static void incrRefCount(robj *o) {
+    o->refcount++;
+}
+
+static void decrRefCount(void *obj) {
+    robj *o = obj;
+
+    /* Object is in memory, or in the process of being swapped out. */
+    if (--o->refcount == 0) {
+        switch (o->type) {
+        case REDIS_STRING: freeStringObject(o); break;
+        default: redisAssert(0); break;
+        }
+    }
+}
+
+static void _redisAssert(char *estr, char *file, int line) {
+    redisLog(REDIS_WARNING, "=== ASSERTION FAILED ===");
+    redisLog(REDIS_WARNING, "==> %s:%d '%s' is not true\n", file, line, estr);
+#ifdef HAVE_BACKTRACE
+    redisLog(REDIS_WARNING, "(forcing SIGSEGV in order to print the stack trace)");
+    *((char *) -1) = 'x';
+#endif
+}
+
+/* =================================== Main! ================================ */
 
 int main(int argc, char **argv)
 {

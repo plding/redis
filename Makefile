@@ -14,17 +14,19 @@ endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG?= -g -ggdb
 
-OBJ = ae.o anet.o redis.o sds.o zmalloc.o
+OBJ = adlist.o ae.o anet.o redis.o sds.o zmalloc.o
 
 PRGNAME = redis-server
 
 all: redis-server
 
 # Deps (use make dep to generate this)
+adlist.o: adlist.c adlist.h zmalloc.h
 ae.o: ae.c ae.h zmalloc.h config.h ae_select.c
 ae_select.o: ae_select.c
 anet.o: anet.c fmacros.h anet.h
-redis.o: redis.c fmacros.h config.h redis.h ae.h sds.h anet.h zmalloc.h
+redis.o: redis.c fmacros.h config.h redis.h ae.h sds.h anet.h adlist.h \
+  zmalloc.h
 sds.o: sds.c sds.h zmalloc.h
 zmalloc.o: zmalloc.c config.h
 
