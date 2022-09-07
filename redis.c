@@ -210,6 +210,11 @@ static void oom(const char *msg) {
     abort();
 }
 
+static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    redisLog(REDIS_VERBOSE, "%zu bytes in use", zmalloc_used_memory());
+    return 1000;
+}
+
 static void initServerConfig() {
     server.port = REDIS_SERVERPORT;
     server.verbosity = REDIS_DEBUG;
@@ -220,6 +225,7 @@ static void initServerConfig() {
 static void initServer() {
     server.el = aeCreateEventLoop();
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
+    aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
 }

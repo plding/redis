@@ -42,7 +42,15 @@
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
-#include "ae_select.c"
+// #ifdef HAVE_EPOLL
+// #include "ae_epoll.c"
+// #else
+//     #ifdef HAVE_KQUEUE
+//     #include "ae_kqueue.c"
+//     #else
+    #include "ae_select.c"
+//     #endif
+// #endif
 
 aeEventLoop *aeCreateEventLoop(void) {
     aeEventLoop *eventLoop;
@@ -50,8 +58,11 @@ aeEventLoop *aeCreateEventLoop(void) {
 
     eventLoop = zmalloc(sizeof(*eventLoop));
     if (!eventLoop) return NULL;
+    eventLoop->timeEventHead = NULL;
+    eventLoop->timeEventNextId = 0;
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
+    eventLoop->beforesleep = NULL;
     if (aeApiCreate(eventLoop) == -1) {
         zfree(eventLoop);
         return NULL;
@@ -64,6 +75,7 @@ aeEventLoop *aeCreateEventLoop(void) {
 }
 
 void aeDeleteEventLoop(aeEventLoop *eventLoop) {
+    aeApiFree(eventLoop);
     zfree(eventLoop);
 }
 
@@ -106,6 +118,147 @@ void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
     aeApiDelEvent(eventLoop, fd, mask);
 }
 
+static void aeGetTime(long *second, long *milliseconds)
+{
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    *second = tv.tv_sec;
+    *milliseconds = tv.tv_usec / 1000;
+}
+
+static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
+    long cur_sec, cur_ms, when_sec, when_ms;
+
+    aeGetTime(&cur_sec, &cur_ms);
+    when_sec = cur_sec + milliseconds / 1000;
+    when_ms = cur_ms + milliseconds % 1000;
+    if (when_ms >= 1000) {
+        when_sec++;
+        when_ms -= 1000;
+    }
+    *sec = when_sec;
+    *ms = when_ms;
+}
+
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
+        aeTimeProc *proc, void *clientData,
+        aeEventFinalizerProc *finalizerProc)
+{
+    long long id = eventLoop->timeEventNextId++;
+    aeTimeEvent *te;
+
+    te = zmalloc(sizeof(*te));
+    if (te == NULL) return AE_ERR;
+    te->id = id;
+    aeAddMillisecondsToNow(milliseconds, &te->when_sec, &te->when_ms);
+    te->timeProc = proc;
+    te->finalizerProc = finalizerProc;
+    te->clientData = clientData;
+    te->next = eventLoop->timeEventHead;
+    eventLoop->timeEventHead = te;
+    return id;
+}
+
+int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
+{
+    aeTimeEvent *te, *prev = NULL;
+
+    te = eventLoop->timeEventHead;
+    while (te) {
+        if (te->id == id) {
+            if (prev == NULL)
+                eventLoop->timeEventHead = te->next;
+            else
+                prev->next = te->next;
+            if (te->finalizerProc)
+                te->finalizerProc(eventLoop, te->clientData);
+            zfree(te);
+            return AE_OK;
+        }
+        prev = te;
+        te = te->next;
+    }
+    return AE_ERR; /* NO event with the specified ID found */
+}
+
+/* Search the first timer to fire.
+ * This operation is useful to know how many time the select can be
+ * put in sleep without to delay any event.
+ * If there are no timers NULL is returned.
+ *
+ * Note that's O(N) since time events are unsorted.
+ * Possible optimizations (not needed by Redis so far, but...):
+ * 1) Insert the event in order, so that the nearest is just the head.
+ *    Much better but still insertion or deletion of timers is O(N).
+ * 2) Use a skiplist to have this operation as O(1) and insertion as O(log(N)).
+ */
+static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
+{
+    aeTimeEvent *te = eventLoop->timeEventHead;
+    aeTimeEvent *nearest = NULL;
+
+    while (te) {
+        if (!nearest || te->when_sec < nearest->when_sec ||
+                (te->when_sec == nearest->when_sec &&
+                 te->when_ms < nearest->when_ms))
+            nearest = te;
+        te = te->next;
+    }
+    return nearest;
+}
+
+/* Process time events */
+static int processTimeEvents(aeEventLoop *eventLoop) {
+    int processed = 0;
+    aeTimeEvent *te;
+    long long maxId;
+
+    te = eventLoop->timeEventHead;
+    maxId = eventLoop->timeEventNextId - 1;
+    while (te) {
+        long now_sec, now_ms;
+        long long id;
+
+        if (te->id > maxId) {
+            te = te->next;
+            continue;
+        }
+        aeGetTime(&now_sec, &now_ms);
+        if (now_sec > te->when_sec ||
+            (now_sec == te->when_sec && now_ms > te->when_ms))
+        {
+            int retval;
+
+            id = te->id;
+            retval = te->timeProc(eventLoop, id, te->clientData);
+            processed++;
+            /* After an event is processed our time event list may
+             * no longer be the same, so we restart from head.
+             * Still we make sure to don't process events registered
+             * by event handlers itself in order to don't loop forever.
+             * To do so we saved the max ID we want to handle.
+             *
+             * FUTURE OPTIMIZATIONS:
+             * Note that this is NOT great algorithmically. Redis uses
+             * a single time event so it's not a problem but the right
+             * way to do this is to add the new elements on head, and
+             * to flag deleted elements in a special way for later
+             * deletion (putting references to the nodes to delete into
+             * another linked list). */
+            if (retval != AE_NOMORE) {
+                aeAddMillisecondsToNow(retval, &te->when_sec, &te->when_ms);
+            } else {
+                aeDeleteTimeEvent(eventLoop, id);
+            }
+            te = eventLoop->timeEventHead;
+        } else {
+            te = te->next;
+        }
+    }
+    return processed;
+}
+
 /* Process every pending time event, then every pending file event
  * (that may be registered by time event callbacks just processed).
  * Without special flags the function sleeps until some file event
@@ -126,11 +279,46 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
-    if (eventLoop->maxfd != -1) {
+    /* Note that we want call select() even if there are no
+     * file events to process as long as we want to process time
+     * events, in order to sleep until the next time event is ready
+     * to fire. */
+    if (eventLoop->maxfd != -1 ||
+        ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
-        struct timeval *tvp;
+        aeTimeEvent *shortest = NULL;
+        struct timeval tv, *tvp;
 
-        tvp = NULL;
+        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            shortest = aeSearchNearestTimer(eventLoop);
+        if (shortest) {
+            long now_sec, now_ms;
+
+            /* Calculate the time missing for the nearest
+             * timer to fire. */
+            aeGetTime(&now_sec, &now_ms);
+            tvp = &tv;
+            tvp->tv_sec = shortest->when_sec - now_sec;
+            if (shortest->when_ms < now_ms) {
+                tvp->tv_usec = (shortest->when_ms + 1000 - now_ms) * 1000;
+                tvp->tv_sec--;
+            } else {
+                tvp->tv_usec = (shortest->when_ms - now_ms) * 1000;
+            }
+            if (tvp->tv_sec < 0) tvp->tv_sec = 0;
+            if (tvp->tv_usec < 0) tvp->tv_usec = 0;
+        } else {
+            /* If we have to check for events but need to return
+             * ASAP because of AE_DONT_WAIT we need to se the timeout
+             * to zero */
+            if (flags & AE_DONT_WAIT) {
+                tv.tv_sec = tv.tv_usec = 0;
+                tvp = &tv;
+            } else {
+                /* Otherwise we can block */
+                tvp = NULL; /* wait forever */
+            }
+        }
 
         numevents = aeApiPoll(eventLoop, tvp);
         for (j = 0; j < numevents; j++) {
@@ -153,6 +341,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             processed++;
         }
     }
+    /* Check time events */
+    if (flags & AE_TIME_EVENTS)
+        processed += processTimeEvents(eventLoop);
 
     return processed; /* return the number of processed file/time events */
 }
