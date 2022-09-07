@@ -208,6 +208,10 @@ static robj *getDecodedObject(robj *o);
 static int processCommand(redisClient *c);
 static void processInputBuffer(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
+static struct redisCommand *lookupCommand(char *name);
+static void call(redisClient *c, struct redisCommand *cmd);
+static void resetClient(redisClient *c);
 
 static void pingCommand(redisClient *c);
 
