@@ -15,10 +15,12 @@ CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
 DEBUG?= -g -ggdb
 
 OBJ = adlist.o ae.o anet.o dict.o redis.o sds.o zmalloc.o
+CLIOBJ = anet.o sds.o adlist.o redis-cli.o zmalloc.o
 
 PRGNAME = redis-server
+CLIPGRNAME = redis-cli
 
-all: redis-server
+all: redis-server redis-cli
 
 # Deps (use make dep to generate this)
 adlist.o: adlist.c adlist.h zmalloc.h
@@ -26,6 +28,7 @@ ae.o: ae.c ae.h zmalloc.h config.h ae_select.c
 ae_select.o: ae_select.c
 anet.o: anet.c fmacros.h anet.h
 dict.o: dict.c fmacros.h dict.h zmalloc.h
+redis-cli.o: redis-cli.c fmacros.h anet.h sds.h adlist.h zmalloc.h
 redis.o: redis.c fmacros.h config.h redis.h ae.h sds.h anet.h dict.h \
   adlist.h zmalloc.h
 sds.o: sds.c sds.h zmalloc.h
@@ -38,6 +41,9 @@ redis-server: $(OBJ)
 	@echo "Launch the redis server with ./redis-server, then in another"
 	@echo "terminal window enter this directory and run 'make test'."
 	@echo ""
+
+redis-cli: $(CLIOBJ)
+	$(CC) -o $(CLIPGRNAME) $(CCOPT) $(DEBUG) $(CLIOBJ)
 
 .c.o:
 	$(CC) -c $(CFLAGS) $(DEBUG) $(COMPILE_TIME) $<
