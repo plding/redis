@@ -945,6 +945,10 @@ static void delCommand(redisClient *c) {
     addReplyLong(c, deleted);
 }
 
+static void existsCommand(redisClient *c) {
+    addReply(c, lookupKeyRead(c->db, c->argv[1]) ? shared.cone : shared.czero);
+}
+
 /* ================================= Expire ================================= */
 
 static int setExpire(redisDb *db, robj *key, time_t when) {
@@ -1027,10 +1031,6 @@ static void ttlCommand(redisClient *c) {
         if (ttl < 0) ttl = -1;
     }
     addReplySds(c, sdscatprintf(sdsempty(), ":%d\r\n", ttl));
-}
-
-static void existsCommand(redisClient *c) {
-    addReply(c, lookupKeyRead(c->db, c->argv[1]) ? shared.cone : shared.czero);
 }
 
 static void _redisAssert(char *estr, char *file, int line) {
