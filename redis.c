@@ -81,7 +81,7 @@
 /* Static server configuration */
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_IOBUF_LEN         1024
-#define REDIS_DEFAULT_DBNUM     1
+#define REDIS_DEFAULT_DBNUM     16
 #define REDIS_MAX_WRITE_PER_EVENT (1024*64)
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 
@@ -168,6 +168,7 @@ struct redisServer {
     int port;
     int fd;
     redisDb *db;
+    long long dirty;            /* changes to DB from the last save */
     list *clients;
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
@@ -219,7 +220,13 @@ static void freeClient(redisClient *c);
 static void addReply(redisClient *c, robj *obj);
 static void addReplySds(redisClient *c, sds s);
 static void incrRefCount(robj *o);
+static robj *createStringObject(char *ptr, size_t len);
 static robj *getDecodedObject(robj *o);
+static int removeExpire(redisDb *db, robj *key);
+static int expireIfNeeded(redisDb *db, robj *key);
+static int deleteKey(redisDb *db, robj *key);
+static time_t getExpire(redisDb *db, robj *key);
+static int setExpire(redisDb *db, robj *key, time_t when);
 static int processCommand(redisClient *c);
 static void processInputBuffer(redisClient *c);
 static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -230,7 +237,13 @@ static void resetClient(redisClient *c);
 
 static void pingCommand(redisClient *c);
 static void setCommand(redisClient *c);
+static void setnxCommand(redisClient *c);
 static void getCommand(redisClient *c);
+static void delCommand(redisClient *c);
+static void existsCommand(redisClient *c);
+static void expireCommand(redisClient *c);
+static void expireatCommand(redisClient *c);
+static void ttlCommand(redisClient *c);
 
 /*================================= Globals ================================= */
 
@@ -239,7 +252,13 @@ static struct redisServer server; /* server global state */
 static struct redisCommand cmdTable[] = {
     {"get", getCommand, 2, REDIS_CMD_INLINE, NULL, 0, 0, 0},
     {"set", setCommand, 3, REDIS_CMD_BULK|REDIS_CMD_DENYOOM, NULL, 0, 0, 0},
+    // {"setnx", setnxCommand, 3, REDIS_CMD_BULK|REDIS_CMD_DENYOOM, NULL, 0, 0, 0},
+    {"del", delCommand, -2, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {"exists", existsCommand, 2, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {"expire", expireCommand, 3, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {"expireat", expireatCommand, 3, REDIS_CMD_INLINE, NULL, 0, 0, 0},
     {"ping", pingCommand, 1, REDIS_CMD_INLINE, NULL, 0, 0, 0},
+    {"ttl", ttlCommand, 2, REDIS_CMD_INLINE, NULL, 0, 0, 0},
     {NULL, NULL, 0, 0, NULL, 0, 0, 0}
 };
 
@@ -314,6 +333,16 @@ static dictType dbDictType = {
     dictRedisObjectDestructor   /* val destructor */
 };
 
+/* Db->expires */
+static dictType keyptrDictType = {
+    dictObjHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictObjKeyCompare,          /* key compare */
+    dictRedisObjectDestructor,  /* key destructor */
+    NULL                        /* val destructor */
+};
+
 /* ========================= Random utility functions ======================= */
 
 /* Redis generally does not try to recover from out of memory conditions
@@ -341,12 +370,14 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
     /* Show some info about non-empty databases */
     for (j = 0; j < server.dbnum; j++) {
-        long long size, used;
+        long long size, used, vkeys;
 
         size = dictSlots(server.db[j].dict);
         used = dictSize(server.db[j].dict);
-        if (!(loops % 5)) {
-            redisLog(REDIS_VERBOSE, "DB %d: %lld keys in %lld slots HT.", j, used, size);
+        vkeys = dictSize(server.db[j].expires);
+        if (!(loops % 5) && (used || vkeys)) {
+            redisLog(REDIS_VERBOSE, "DB %d: %lld keys (%lld volatile) in %lld slots HT.", j, used, vkeys, size);
+            /* dictPrintStats(server.dict); */
         }
     }
 
@@ -398,6 +429,7 @@ static void initServer() {
     }
     for (j = 0; j < server.dbnum; j++) {
         server.db[j].dict = dictCreate(&dbDictType, NULL);
+        server.db[j].expires = dictCreate(&keyptrDictType, NULL);
         server.db[j].id = j;
     }
     server.cronloops = 0;
@@ -538,6 +570,14 @@ static int processCommand(redisClient *c) {
                 (char *) c->argv[0]->ptr));
         resetClient(c);
         return 1;
+    } else if ((cmd->arity > 0 && cmd->arity != c->argc) ||
+               (c->argc < -cmd->arity)) {
+        addReplySds(c,
+            sdscatprintf(sdsempty(),
+                "-ERR wrong number of arguments for '%s' command\r\n",
+                cmd->name));
+        resetClient(c);
+        return 1;
     }
 
     call(c, cmd);
@@ -649,6 +689,11 @@ static int selectDb(redisClient *c, int id) {
     return DICT_OK;
 }
 
+static void *dupClientReplyValue(void *o) {
+    incrRefCount((robj *) o);
+    return o;
+}
+
 static redisClient *createClient(int fd) {
     redisClient *c = zmalloc(sizeof(*c));
 
@@ -666,6 +711,7 @@ static redisClient *createClient(int fd) {
     c->lastinteraction = time(NULL);
     c->reply = listCreate();
     listSetFreeMethod(c->reply, decrRefCount);
+    listSetDupMethod(c->reply, dupClientReplyValue);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
         freeClient(c);
@@ -686,6 +732,44 @@ static void addReplySds(redisClient *c, sds s) {
     robj *o = createObject(REDIS_STRING, s);
     addReply(c, o);
     decrRefCount(o);
+}
+
+static void addReplyDouble(redisClient *c, double d) {
+    char buf[128];
+
+    snprintf(buf, sizeof(buf), "%.17g", d);
+    addReplySds(c, sdscatprintf(sdsempty(), "$%lu\r\n%s\r\n",
+        (unsigned long) strlen(buf), buf));
+}
+
+static void addReplyLong(redisClient *c, long l) {
+    char buf[128];
+    size_t len;
+
+    if (l == 0) {
+        addReply(c, shared.czero);
+        return;
+    } else if (l == 1) {
+        addReply(c, shared.cone);
+        return;
+    }
+    len = snprintf(buf, sizeof(buf), ":%ld\r\n", l);
+    addReplySds(c, sdsnewlen(buf, len));
+}
+
+static void addReplyUlong(redisClient *c, unsigned long ul) {
+    char buf[128];
+    size_t len;
+
+    if (ul == 0) {
+        addReply(c, shared.czero);
+        return;
+    } else if (ul == 1) {
+        addReply(c, shared.cone);
+        return;
+    }
+    len = snprintf(buf, sizeof(buf), ":%lu\r\n", ul);
+    addReplySds(c, sdsnewlen(buf, len));
 }
 
 static void addReplyBulkLen(redisClient *c, robj *obj) {
@@ -773,6 +857,7 @@ static robj *lookupKey(redisDb *db, robj *key) {
 }
 
 static robj *lookupKeyRead(redisDb *db, robj *key) {
+    expireIfNeeded(db, key);
     return lookupKey(db, key);
 }
 
@@ -780,6 +865,20 @@ static robj *lookupKeyReadOrReply(redisClient *c, robj *key, robj *reply) {
     robj *o = lookupKeyRead(c->db, key);
     if (!o) addReply(c, reply);
     return o;
+}
+
+static int deleteKey(redisDb *db, robj *key) {
+    int retval;
+
+    /* We need to protect key from destruction: after the first dictDelete()
+     * it may happen that 'key' is no longer valid if we don't increment
+     * it's count. This may happen when we get the object reference directly
+     * from the hash table with dictRandomKey() or dict iterators */
+    // incrRefCount(key);
+    retval = dictDelete(db->dict, key);
+    // decrRefCount(key);
+
+    return retval == DICT_OK;
 }
 
 /* Get a decoded version of an encoded object (returned as a new object).
@@ -830,6 +929,108 @@ static int getGenericCommand(redisClient *c) {
 
 static void getCommand(redisClient *c) {
     getGenericCommand(c);
+}
+
+/* ========================= Type agnostic commands ========================= */
+
+static void delCommand(redisClient *c) {
+    int deleted = 0, j;
+
+    for (j = 1; j < c->argc; j++) {
+        if (deleteKey(c->db, c->argv[j])) {
+            server.dirty++;
+            deleted++;
+        }
+    }
+    addReplyLong(c, deleted);
+}
+
+/* ================================= Expire ================================= */
+
+static int setExpire(redisDb *db, robj *key, time_t when) {
+    if (dictAdd(db->expires, key, (void *) when) == DICT_ERR) {
+        return 0;
+    } else {
+        incrRefCount(key);
+        return 1;
+    }
+}
+
+/* Return the expire time of the specified key, or -1 if no expire
+ * is associated with this key (i.e. the key is non volatile) */
+static time_t getExpire(redisDb *db, robj *key) {
+    dictEntry *de;
+
+    /* No expire? return ASAP */
+    if (dictSize(db->expires) == 0 ||
+        (de = dictFind(db->expires, key)) == NULL) return -1;
+    
+    return (time_t) dictGetEntryVal(de);
+}
+
+static int expireIfNeeded(redisDb *db, robj *key) {
+    time_t when;
+    dictEntry *de;
+
+    /* No expire? return ASAP */
+    if (dictSize(db->expires) == 0 ||
+        (de = dictFind(db->expires, key)) == NULL) return 0;
+    
+    /* Lookup the expire */
+    when = (time_t) dictGetEntryVal(de);
+    if (time(NULL) <= when) return 0;
+
+    /* Delete the key */
+    dictDelete(db->expires, key);
+    return dictDelete(db->dict, key) == DICT_OK;
+}
+
+static void expireGenericCommand(redisClient *c, robj *key, time_t seconds) {
+    dictEntry *de;
+
+    de = dictFind(c->db->dict, key);
+    if (de == NULL) {
+        addReply(c, shared.czero);
+        return;
+    }
+    if (seconds < 0) {
+        if (deleteKey(c->db, key)) server.dirty++;
+        addReply(c, shared.cone);
+        return;
+    } else {
+        time_t when = time(NULL) + seconds;
+        if (setExpire(c->db, key, when)) {
+            addReply(c, shared.cone);
+            server.dirty++;
+        } else {
+            addReply(c, shared.czero);
+        }
+        return;
+    }
+}
+
+static void expireCommand(redisClient *c) {
+    expireGenericCommand(c, c->argv[1], strtol(c->argv[2]->ptr, NULL , 10));
+}
+
+static void expireatCommand(redisClient *c) {
+    expireGenericCommand(c, c->argv[1], strtol(c->argv[2]->ptr, NULL , 10) - time(NULL));
+}
+
+static void ttlCommand(redisClient *c) {
+    time_t expire;
+    int ttl = -1;
+
+    expire = getExpire(c->db, c->argv[1]);
+    if (expire != -1) {
+        ttl = (int) (expire - time(NULL));
+        if (ttl < 0) ttl = -1;
+    }
+    addReplySds(c, sdscatprintf(sdsempty(), ":%d\r\n", ttl));
+}
+
+static void existsCommand(redisClient *c) {
+    addReply(c, lookupKeyRead(c->db, c->argv[1]) ? shared.cone : shared.czero);
 }
 
 static void _redisAssert(char *estr, char *file, int line) {

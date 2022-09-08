@@ -215,6 +215,47 @@ int dictAdd(dict *ht, void *key, void *val)
     return DICT_OK;
 }
 
+/* Search and remove an element */
+static int dictGenericDelete(dict *ht, const void *key, int nofree)
+{
+    unsigned int h;
+    dictEntry *he, *prevHe;
+
+    if (ht->size == 0)
+        return DICT_ERR;
+    h = dictHashKey(ht, key) & ht->sizemask;
+    he = ht->table[h];
+
+    prevHe = NULL;
+    while (he) {
+        if (dictCompareHashKeys(ht, key, he->key)) {
+            /* Unlink the element from the list */
+            if (prevHe)
+                prevHe->next = he->next;
+            else
+                ht->table[h] = he->next;
+            if (!nofree) {
+                dictFreeEntryKey(ht, he);
+                dictFreeEntryVal(ht, he);
+            }
+            _dictFree(he);
+            ht->used--;
+            return DICT_OK;
+        }
+        prevHe = he;
+        he = he->next;
+    }
+    return DICT_ERR; /* not found */
+}
+
+int dictDelete(dict *ht, const void *key) {
+    return dictGenericDelete(ht, key, 0);
+}
+
+int dictDeleteNoFree(dict *ht, const void *key) {
+    return dictGenericDelete(ht, key, 1);
+}
+
 dictEntry *dictFind(dict *ht, const void *key)
 {
     dictEntry *he;
